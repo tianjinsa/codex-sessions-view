@@ -1,0 +1,48 @@
+{
+  "currency": "USD",
+  "currency_symbol": "$",
+  "models": {
+    "gpt-6-sol": {
+      "input": 2.00,
+      "cached_input": 0.20,
+      "output": 10.00,
+      "note": "即 GPT-6 Sol；部分文档中也直接称为 GPT-6"
+    },
+    "gpt-6-luna": {
+      "input": 0.10,
+      "cached_input": 0.01,
+      "output": 0.50,
+      "note": "GPT-6 系列轻量/高吞吐模型"
+    },
+    "gpt-6-astra": {
+      "input": 10.00,
+      "cached_input": 1.00,
+      "output": 50.00,
+      "note": "即 GPT-6 Pro / GPT-6 Astra；GPT-6 系列旗舰"
+    },
+    "gpt-6.1-sol": {
+      "input": 2.00,
+      "cached_input": 0.10,
+      "output": 10.00,
+      "note": "GPT-6.1 主力模型"
+    },
+    "gpt-6.1-terra": {
+      "input": 1.00,
+      "cached_input": 0.05,
+      "output": 5.00,
+      "note": "GPT-6.1 高性价比模型"
+    },
+    "gpt-6.2-sol": {
+      "input": 2.00,
+      "cached_input": 0.10,
+      "output": 10.00,
+      "note": "GPT-6.2 主力模型，定价与 6.1 Sol 一致"
+    },
+    "gpt-6.2-astra": {
+      "input": 8.00,
+      "cached_input": 0.40,
+      "output": 40.00,
+      "note": "GPT-6.2 旗舰模型"
+    }
+  }
+}

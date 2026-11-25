@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+preview-*.png
+codex-usage-*.csv
