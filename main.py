@@ -6,9 +6,11 @@ import argparse
 import csv
 import sys
 from dataclasses import replace
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Event
+from time import monotonic
 from typing import Callable, Iterable
 
 from PyQt6.QtCore import (
@@ -54,6 +56,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -72,6 +75,7 @@ from codex_ledger import (
     PriceConfig,
     ScanResult,
     Session,
+    Turn,
     Usage,
     UsageRecord,
     aggregate_cost,
@@ -79,6 +83,7 @@ from codex_ledger import (
     cache_ceiling,
     cache_ceiling_many,
     default_config_path,
+    default_sessions_path,
     load_config,
     parse_amount,
     save_config,
@@ -110,8 +115,8 @@ def short_model(name: str) -> str:
     return name if name else "未知模型"
 
 
-def display_time(value: datetime | None) -> str:
-    return value.astimezone().strftime("%Y-%m-%d %H:%M") if value else "—"
+def display_time(value: datetime | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    return value.astimezone().strftime(fmt) if value else "—"
 
 
 def duration_text(seconds: float | None) -> str:
@@ -145,11 +150,12 @@ def tooltip_html(blocks: list[tuple[str, str, str]]) -> str:
     for index, (label, color, body) in enumerate(blocks):
         if index:
             parts.append("<hr style='border:none; border-top:1px solid #D7E0E2; margin:7px 0;'>")
+        body_html = html_escape(body).replace("\n", "<br>")
         parts.append(
             f"<div style='margin:0;'>"
             f"<span style='color:{color}; font-weight:600;'>{html_escape(label)}</span>"
             f"</div>"
-            f"<div style='color:#1E2C32; margin-top:2px;'>{html_escape(body)}</div>"
+            f"<div style='color:#1E2C32; margin-top:2px;'>{body_html}</div>"
         )
     parts.append("</div>")
     return "".join(parts)
@@ -266,31 +272,47 @@ def filtered_sessions(
     end: date | None = None,
     model: str = "",
     query: str = "",
+    *,
+    subagent: bool | None = None,
 ) -> list[Session]:
     result = []
     query = query.strip().casefold()
     for session in sessions:
+        if subagent is not None and session.is_subagent != subagent:
+            continue
+        if query:
+            fields = [session.session_id, session.cwd, str(session.path), *session.models]
+            if session.subagent:
+                agent = session.subagent
+                fields.extend([agent.nickname, agent.path, agent.role, agent.parent_thread_id])
+            for turn in session.turns:
+                fields.extend([turn.user_prompt, *turn.follow_ups])
+                fields.extend(message.text for message in turn.agent_messages)
+            if not any(query in field.casefold() for field in fields):
+                continue
+        if start is None and end is None and not model:
+            result.append(session)
+            continue
         records = []
         for record in session.records:
-            local_date = record.timestamp.astimezone().date()
-            if start and local_date < start:
-                continue
-            if end and local_date > end:
-                continue
             if model and record.model != model:
                 continue
+            if start or end:
+                local_date = record.timestamp.astimezone().date()
+                if (start and local_date < start) or (end and local_date > end):
+                    continue
             records.append(record)
         if not records:
             continue
-        if query:
-            haystack = " ".join(
-                [session.session_id, session.cwd, str(session.path), *session.models]
-            ).casefold()
-            if query not in haystack:
-                continue
-        result.append(replace(session, records=records))
+        visible_lines = {record.line_number for record in records}
+        turns = []
+        for turn in session.turns:
+            turn_records = [record for record in turn.records if record.line_number in visible_lines]
+            if turn_records:
+                turns.append(replace(turn, records=turn_records, started_at=turn.start))
+        result.append(replace(session, records=records, turns=turns))
     return sorted(
-        result, key=lambda item: item.start or datetime.min.astimezone(), reverse=True
+        result, key=lambda item: item.end or datetime.min.replace(tzinfo=timezone.utc), reverse=True
     )
 
 
@@ -300,6 +322,7 @@ class NumericItem(QTableWidgetItem):
     def __init__(self, text: str, value: int | float | Decimal):
         super().__init__(text)
         self.setData(Qt.ItemDataRole.UserRole, value)
+        self.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
     def __lt__(self, other: QTableWidgetItem) -> bool:
         mine = self.data(Qt.ItemDataRole.UserRole)
@@ -316,6 +339,13 @@ def table_item(text: str, align_right: bool = False, color: str | None = None) -
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     if color:
         item.setForeground(QColor(color))
+    return item
+
+
+def model_names_item(models: list[str]) -> QTableWidgetItem:
+    text = "、".join(models)
+    item = table_item(text or "—")
+    item.setToolTip(html_escape(text))
     return item
 
 
@@ -528,7 +558,7 @@ class SpendChart(QWidget):
 
         self.values: list[tuple[str, Decimal]] = []
         self.symbol = "$"
-        self.setMinimumHeight(210)
+        self.setMinimumHeight(180)
         self.figure = Figure(figsize=(6, 2.4), dpi=100, facecolor="#FFFFFF")
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setStyleSheet("background: white;")
@@ -706,22 +736,28 @@ class ScanWorker(QObject):
     def __init__(self, path: Path):
         super().__init__()
         self.path = path
-        self._cancelled = False
+        self._cancelled = Event()
+        self._last_progress = 0.0
 
     def cancel(self):
-        self._cancelled = True
+        self._cancelled.set()
 
     def run(self):
         try:
-            result = scan_sessions(self.path, self.on_progress)
+            result = scan_sessions(self.path, self.on_progress, cancelled=self._cancelled.is_set)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
         self.finished.emit(result)
 
     def on_progress(self, current: int, total: int) -> bool:
-        self.progressed.emit(current, total)
-        return not self._cancelled
+        if self._cancelled.is_set():
+            return False
+        now = monotonic()
+        if current in (0, total) or now - self._last_progress >= 0.08:
+            self._last_progress = now
+            self.progressed.emit(current, total)
+        return True
 
 
 class PriceDialog(QDialog):
@@ -863,8 +899,6 @@ class CostDetailMixin:
     """会话详情与任务详情共用的费用构成视图。"""
 
     def build_cost_block(self, records, config: PriceConfig, usage: Usage):
-        from codex_ledger import aggregate_cost_breakdown
-
         card = QFrame()
         card.setObjectName("card")
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -891,7 +925,8 @@ class CostDetailMixin:
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         models = sorted({record.model for record in records if record.model})
-        reference = config.find(models[0]) if models else None
+        reference = config.find(models[0]) if len(models) == 1 else None
+        price_hint = "按模型计价" if len(models) > 1 else "未配置" if models else "—"
         rows = [
             ("非缓存输入", usage.uncached_input_tokens,
              reference.input if reference else None, parts.uncached_input),
@@ -906,9 +941,9 @@ class CostDetailMixin:
             table.setItem(row, 0, table_item(name))
             table.setItem(row, 1, NumericItem(tokens(token_count), token_count))
             table.setItem(row, 2, table_item(
-                money(price, config.currency_symbol, 4) if price is not None else "未配置",
+                money(price, config.currency_symbol, 4) if price is not None else price_hint,
                 align_right=True,
-                color=None if price is not None else "#AF5B32",
+                color="#AF5B32" if price_hint == "未配置" and price is None else None,
             ))
             table.setItem(row, 3, NumericItem(money(amount, config.currency_symbol, 6), amount))
             table.setItem(row, 4, NumericItem(
@@ -933,10 +968,28 @@ class CostDetailMixin:
         return card
 
 
+def turn_message_blocks(turn: Turn) -> list[tuple[str, str, str]]:
+    blocks = []
+    if turn.user_prompt:
+        blocks.append(("首条提问", "#11745F", turn.user_prompt))
+    for number, follow_up in enumerate(turn.follow_ups, 1):
+        blocks.append((f"补充 {number}", "#4979B8", follow_up))
+    for message in turn.agent_messages:
+        label = "委派任务" if message.starts_turn else "智能体消息"
+        blocks.append((f"{label} · {message.author}", "#4979B8", message.text))
+    if turn.last_agent_message:
+        blocks.append(("最终回复", "#9271B5", turn.last_agent_message))
+    return blocks
+
+
+def text_preview(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 class TurnDialog(QDialog, CostDetailMixin):
     """单个任务轮次的用量与费用构成。"""
 
-    def __init__(self, turn, config: PriceConfig, parent=None):
+    def __init__(self, turn: Turn, config: PriceConfig, parent=None):
         super().__init__(parent)
         self.setWindowTitle("任务用量明细")
         self.resize(920, 640)
@@ -944,6 +997,8 @@ class TurnDialog(QDialog, CostDetailMixin):
         layout.setContentsMargins(28, 24, 28, 22)
         title = QLabel(turn.summary_text(80))
         title.setObjectName("dialogTitle")
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setWordWrap(True)
         layout.addWidget(title)
         usage = turn.usage
         meta = QLabel(
@@ -953,11 +1008,21 @@ class TurnDialog(QDialog, CostDetailMixin):
             f"API 调用 {len(turn.records)} 次　缓存命中率 {cache_rate_text(usage)}\n"
             f"补充消息 {len(turn.follow_ups)} 条"
             + (f"　并入内部轮 {turn.absorbed_auto_turns} 个" if turn.absorbed_auto_turns else "")
+            + (f"\n父轮次 ID {turn.parent_turn_id}" if turn.parent_turn_id else "")
         )
         meta.setObjectName("muted")
+        meta.setTextFormat(Qt.TextFormat.PlainText)
         meta.setWordWrap(True)
         layout.addWidget(meta)
-        layout.addWidget(self.build_cost_block(turn.records, config, usage), 1)
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(self.build_cost_block(turn.records, config, usage), "用量与费用")
+        messages = "\n\n".join(f"{label}\n{body}" for label, _, body in turn_message_blocks(turn))
+        content = QPlainTextEdit(messages or "该轮次暂无可显示的消息。")
+        content.setReadOnly(True)
+        content.document().setDocumentMargin(16)
+        tabs.addTab(content, "任务内容")
+        layout.addWidget(tabs, 1)
         buttons = QDialogButtonBox()
         close = buttons.addButton("关闭", QDialogButtonBox.ButtonRole.AcceptRole)
         close.setObjectName("primaryButton")
@@ -966,51 +1031,72 @@ class TurnDialog(QDialog, CostDetailMixin):
 
 
 class SessionDialog(QDialog, CostDetailMixin):
-    def __init__(self, session: Session, config: PriceConfig, parent=None):
+    def __init__(self, session: Session, config: PriceConfig, parent=None, *, parent_title: str = ""):
         super().__init__(parent)
         self.setWindowTitle("会话用量明细")
-        self.resize(790, 600)
+        self.resize(1180, 770)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 26, 28, 24)
         title = QLabel(session.title)
         title.setObjectName("dialogTitle")
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setWordWrap(True)
         layout.addWidget(title)
-        metadata = QLabel(
-            f"{display_time(session.start)}  →  {display_time(session.end)}\n"
-            f"模型：{'、'.join(session.models) or '未知模型'}\n"
-            f"缓存命中率：{cache_rate_text(session.usage)}"
-            f"（{tokens(session.usage.cached_input_tokens)} / {tokens(session.usage.input_tokens)} 输入 tokens）\n"
-            f"会话 ID：{session.session_id}\n文件：{session.path}"
-        )
+        usage = session.usage
+        lines = [
+            f"{display_time(session.start)}  →  {display_time(session.end)}",
+            f"API 调用 {len(session.records)} 次 · 缓存命中率 {cache_rate_text(usage)}"
+            f"（{tokens(usage.cached_input_tokens)} / {tokens(usage.input_tokens)} 输入 tokens）",
+            f"会话 ID：{session.session_id}",
+        ]
+        if session.subagent:
+            agent = session.subagent
+            identity = []
+            if agent.path:
+                identity.append(f"智能体路径 {agent.path}")
+            if agent.role:
+                identity.append(f"角色 {agent.role}")
+            if agent.depth is not None:
+                identity.append(f"层级 {agent.depth}")
+            if identity:
+                lines.append(" · ".join(identity))
+            if agent.parent_thread_id:
+                parent_label = f"父会话 ID：{agent.parent_thread_id}"
+                if parent_title:
+                    parent_label += f" · {text_preview(parent_title, 48)}"
+                lines.append(parent_label)
+        lines.append(f"文件：{session.path}")
+        metadata = QLabel("\n".join(lines))
         metadata.setObjectName("muted")
+        metadata.setTextFormat(Qt.TextFormat.PlainText)
         metadata.setWordWrap(True)
         metadata.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(metadata)
         if session.cwd:
             cwd = QLabel(f"工作目录：{session.cwd}")
+            cwd.setTextFormat(Qt.TextFormat.PlainText)
             cwd.setWordWrap(True)
             cwd.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             layout.addWidget(cwd)
-        chart_row = QHBoxLayout()
-        chart_row.setSpacing(16)
-        chart_row.addWidget(
-            self.build_cost_block(session.records, config, session.usage), 1,
-        )
-        layout.addLayout(chart_row)
+        layout.addWidget(self.build_cost_block(session.records, config, usage))
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
-        tabs.addTab(self.build_turn_table(session, config), f"任务轮次（{len([t for t in session.turns if t.records])}）")
+        if session.turns:
+            turn_page = self.build_turn_table(session, config)
+        else:
+            empty = "日志中暂无可显示的执行轮次。" if session.is_subagent else "日志中未识别到用户发起的任务。"
+            turn_page = QLabel(empty)
+            turn_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            turn_page.setObjectName("muted")
+        turn_label = "执行轮次" if session.is_subagent else "任务轮次"
+        tabs.addTab(turn_page, f"{turn_label}（{session.turn_count}）")
         tabs.addTab(self.build_model_table(session, config), "按模型")
         tabs.setMinimumHeight(240)
         layout.addWidget(tabs, 1)
-        formula = QLabel(
-            "计费公式：(输入 − 缓存输入) × 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价，再除以 1,000,000。\n"
-            "轮次按 JSONL 中的 turn_id 划分（task_started → task_complete/turn_aborted）；"
-            "若使用日期筛选，此处仅展示筛选范围内的调用。输出 token 中已包含 reasoning，不另行重复计费。"
-        )
-        formula.setObjectName("muted")
-        formula.setWordWrap(True)
-        layout.addWidget(formula)
+        hint = QLabel(f"双击{turn_label}可查看消息与用量。用量按当前筛选统计，时间取自原始日志。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         buttons = QDialogButtonBox()
         close = buttons.addButton("关闭", QDialogButtonBox.ButtonRole.AcceptRole)
         close.setObjectName("primaryButton")
@@ -1018,46 +1104,50 @@ class SessionDialog(QDialog, CostDetailMixin):
         layout.addWidget(buttons)
 
     def build_turn_table(self, session: Session, config: PriceConfig) -> QTableWidget:
-        table = HoverTable(0, 12)
+        table = HoverTable(session.turn_count, 12)
+        summary_header = "执行摘要" if session.is_subagent else "任务（首条提问）"
         table.setHorizontalHeaderLabels(
             [
-                "#", "任务（首条提问）", "状态", "开始时间", "完成时间", "耗时", "模型",
+                "#", summary_header, "状态", "开始时间", "完成时间", "耗时", "模型",
                 "非缓存输入", "缓存输入", "输出", "缓存命中率", "估算费用",
             ]
         )
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setMinimumSectionSize(64)
-        for column in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
-            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header = table.horizontalHeader()
+        header.setMinimumSectionSize(38)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        for column, width in ((1, 215), (6, 108)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(column, width)
+        header.moveSection(header.visualIndex(11), 3)
+        header.setStretchLastSection(True)
         table.setWordWrap(False)
         table.setTextElideMode(Qt.TextElideMode.ElideRight)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(34)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        turns = [turn for turn in session.turns if turn.records]
-        for index, turn in enumerate(turns, 1):
+        for row, turn in enumerate(session.turns):
             usage = turn.usage
             cost, unpriced, _ = aggregate_cost(turn.records, config)
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, NumericItem(str(index), index))
+            number = row + 1
+            table.setItem(row, 0, NumericItem(str(number), number))
             # 列表里只显示提问摘要，完整内容放在悬停提示中，避免长文本挤压列宽。
             label = turn.summary_text()
             if turn.follow_ups:
                 label += f"（+{len(turn.follow_ups)} 条补充）"
             title_item = table_item(label)
-            blocks: list[tuple[str, str, str]] = []
-            if turn.user_prompt:
-                blocks.append(("首条提问", "#11745F", turn.user_prompt[:600]))
-            for number, follow in enumerate(turn.follow_ups, 1):
-                blocks.append((f"补充 {number}", "#4979B8", follow[:400]))
-            if turn.last_agent_message:
-                blocks.append(("最终回复", "#9271B5", turn.last_agent_message[:600]))
+            messages = turn_message_blocks(turn)
+            blocks = [(name, color, text_preview(body, 600)) for name, color, body in messages[:5]]
+            if len(messages) > 5 or any(len(body) > 600 for _, _, body in messages[:5]):
+                blocks.append(("完整内容", MUTED, "双击打开任务详情，切换到「任务内容」。"))
             meta = []
             if turn.turn_id:
                 meta.append(f"turn_id {turn.turn_id}")
+            if turn.parent_turn_id:
+                meta.append(f"父轮次 ID {turn.parent_turn_id}")
             meta.append(f"状态 {turn.status_text}")
             if turn.duration_seconds is not None:
                 meta.append(f"耗时 {duration_text(turn.duration_seconds)}")
@@ -1070,23 +1160,24 @@ class SessionDialog(QDialog, CostDetailMixin):
             if turn.ended_unexpectedly:
                 status_item.setForeground(QColor("#AF5B32"))
             table.setItem(row, 2, status_item)
-            table.setItem(row, 3, table_item(display_time(turn.start)))
-            table.setItem(row, 4, table_item(display_time(turn.completed_at) if turn.completed_at else "—"))
+            table.setItem(row, 3, table_item(display_time(turn.start, "%m-%d %H:%M:%S")))
+            table.setItem(row, 4, table_item(display_time(turn.completed_at, "%m-%d %H:%M:%S")))
             duration = turn.duration_seconds
             table.setItem(
                 row, 5,
                 NumericItem(duration_text(duration) if duration is not None else "—", duration or 0),
             )
-            table.setItem(row, 6, table_item("、".join(turn.models) or "未知模型"))
+            table.setItem(row, 6, model_names_item(turn.models))
             table.setItem(row, 7, NumericItem(tokens(usage.uncached_input_tokens), usage.uncached_input_tokens))
             table.setItem(row, 8, NumericItem(tokens(usage.cached_input_tokens), usage.cached_input_tokens))
             table.setItem(row, 9, output_item(usage))
             table.setItem(row, 10, cache_rate_item(usage, turn.records))
-            table.setItem(row, 11, table_item(
-                money(cost, config.currency_symbol) if not unpriced else "部分未定价",
-                align_right=True,
-                color="#AF5B32" if unpriced else ACCENT,
-            ))
+            amount = money(cost, config.currency_symbol) if turn.records else "—"
+            cost_item = NumericItem(f"≥ {amount}" if unpriced else amount, cost)
+            if unpriced:
+                cost_item.setForeground(QColor("#AF5B32"))
+                cost_item.setToolTip(f"{tokens(unpriced)} tokens 未配置价格")
+            table.setItem(row, 11, cost_item)
             # 行首存轮次对象，双击时用于展示这一轮自己的费用构成。
             table.item(row, 0).setData(Qt.ItemDataRole.UserRole + 2, turn)
         table.doubleClicked.connect(
@@ -1142,10 +1233,12 @@ class LedgerWindow(QMainWindow):
         self.filtered: list[Session] = []
         self.current_page = 0
         self.scan_generation = 0
-        self.scan_thread: QThread | None = None
+        self.scan_threads: dict[QThread, ScanWorker] = {}
         self.scan_worker: ScanWorker | None = None
+        self.scan_report: ScanResult | None = None
+        self.scan_error = ""
+        self.is_scanning = False
         self.closing = False
-        self.scan_cancelled = False
         self.setWindowTitle("Codex Session Ledger")
         self.resize(1380, 880)
         self.setMinimumSize(1060, 700)
@@ -1166,14 +1259,9 @@ class LedgerWindow(QMainWindow):
         root_layout.addLayout(content, 1)
 
         header = QHBoxLayout()
-        titles = QVBoxLayout()
         self.heading = QLabel("费用总览")
         self.heading.setObjectName("pageTitle")
-        self.subtitle = QLabel("本地会话 · 按 API 调用计价")
-        self.subtitle.setObjectName("muted")
-        titles.addWidget(self.heading)
-        titles.addWidget(self.subtitle)
-        header.addLayout(titles)
+        header.addWidget(self.heading)
         header.addStretch()
         self.export_button = QPushButton("导出 CSV")
         self.export_button.setObjectName("secondaryButton")
@@ -1186,11 +1274,9 @@ class LedgerWindow(QMainWindow):
         content.addLayout(header)
 
         source_row = QHBoxLayout()
-        folder_icon = QLabel("⌁")
-        folder_icon.setObjectName("folderIcon")
-        source_row.addWidget(folder_icon)
         self.source_edit = QLineEdit(str(self.root_path))
         self.source_edit.setClearButtonEnabled(True)
+        self.source_edit.setAccessibleName("JSONL 来源路径")
         self.source_edit.setPlaceholderText("选择 Codex sessions 文件夹或一个 .jsonl 文件")
         self.source_edit.returnPressed.connect(self.start_scan)
         source_row.addWidget(self.source_edit, 1)
@@ -1213,22 +1299,22 @@ class LedgerWindow(QMainWindow):
         self.period.setMinimumWidth(126)
         self.period.currentIndexChanged.connect(self.period_changed)
         filter_layout.addWidget(self.period)
-        self.start_date = QDateEdit(QDate.currentDate())
-        self.end_date = QDateEdit(QDate.currentDate())
-        for editor in (self.start_date, self.end_date):
-            editor.setCalendarPopup(True)
-            editor.setDisplayFormat("yyyy-MM-dd")
-            editor.setVisible(False)
-            editor.dateChanged.connect(self.apply_filters)
-            filter_layout.addWidget(editor)
         self.model_filter = QComboBox()
         self.model_filter.setMinimumWidth(155)
         self.model_filter.addItem("全部模型", "")
         self.model_filter.currentIndexChanged.connect(self.apply_filters)
         filter_layout.addWidget(self.model_filter)
+        self.session_kind_filter = QComboBox()
+        self.session_kind_filter.setAccessibleName("会话类型")
+        self.session_kind_filter.addItem("全部会话", None)
+        self.session_kind_filter.addItem("主会话", False)
+        self.session_kind_filter.addItem("子智能体", True)
+        self.session_kind_filter.setMinimumWidth(106)
+        self.session_kind_filter.currentIndexChanged.connect(self.apply_filters)
+        filter_layout.addWidget(self.session_kind_filter)
         self.search = QLineEdit()
         self.search.setClearButtonEnabled(True)
-        self.search.setPlaceholderText("搜索会话 ID、路径或模型")
+        self.search.setPlaceholderText("搜索提问、智能体、ID、路径或模型")
         self.search.setMinimumWidth(210)
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -1238,14 +1324,34 @@ class LedgerWindow(QMainWindow):
         filter_layout.addWidget(self.search, 1)
         content.addWidget(self.filter_bar)
 
+        self.date_filter_bar = QWidget()
+        date_layout = QHBoxLayout(self.date_filter_bar)
+        date_layout.setContentsMargins(0, 0, 0, 0)
+        date_layout.addWidget(QLabel("日期范围"))
+        self.start_date = QDateEdit(QDate.currentDate())
+        self.end_date = QDateEdit(QDate.currentDate())
+        for editor, name in ((self.start_date, "开始日期"), (self.end_date, "结束日期")):
+            editor.setAccessibleName(name)
+            editor.setCalendarPopup(True)
+            editor.setDisplayFormat("yyyy-MM-dd")
+            editor.dateChanged.connect(self.apply_filters)
+            date_layout.addWidget(editor)
+        date_layout.addStretch()
+        self.date_filter_bar.hide()
+        content.addWidget(self.date_filter_bar)
+
+        self.empty_state = QLabel()
+        self.empty_state.setObjectName("emptyState")
+        self.empty_state.setWordWrap(True)
+        self.empty_state.hide()
+        content.addWidget(self.empty_state)
+
         self.stack = QStackedWidget()
         self.stack.addWidget(self.build_overview())
         self.stack.addWidget(self.build_sessions_page())
         self.stack.addWidget(self.build_models_page())
         self.stack.addWidget(self.build_days_page())
-        # 窗口变矮时不能让卡片继续被压缩，否则标签会互相重叠。
-        # 给内容区一个最小高度，再由滚动区兜底。
-        self.stack.setMinimumHeight(430)
+        self.stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.content_scroll = QScrollArea()
         self.content_scroll.setObjectName("contentScroll")
         self.content_scroll.setWidgetResizable(True)
@@ -1254,23 +1360,32 @@ class LedgerWindow(QMainWindow):
         self.content_scroll.setWidget(self.stack)
         content.addWidget(self.content_scroll, 1)
         self.stack.currentChanged.connect(self.update_scroll_policy)
+        self.update_scroll_policy()
         footer = QHBoxLayout()
         self.status = QLabel("准备扫描本地会话…")
         self.status.setObjectName("muted")
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.scan_details_button = QPushButton("扫描详情")
+        self.scan_details_button.setObjectName("textButton")
+        self.scan_details_button.clicked.connect(self.show_scan_details)
+        self.scan_details_button.hide()
         self.progress = QProgressBar()
         self.progress.setFixedWidth(140)
         self.progress.setTextVisible(False)
         self.progress.setVisible(False)
         footer.addWidget(self.status, 1)
+        footer.addWidget(self.scan_details_button)
         footer.addWidget(self.progress)
         content.addLayout(footer)
 
     def update_scroll_policy(self):
         """表格页用自身滚动条；总览页内容固定，交给外层滚动区。"""
         is_overview = self.stack.currentIndex() == 0
-        if is_overview:
-            self.content_scroll.verticalScrollBar().setEnabled(True)
-        else:
+        self.stack.setMinimumHeight(self.stack.widget(0).minimumSizeHint().height() if is_overview else 0)
+        self.content_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if is_overview else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        if not is_overview:
             self.content_scroll.verticalScrollBar().setValue(0)
 
     def build_sidebar(self) -> QWidget:
@@ -1286,9 +1401,6 @@ class LedgerWindow(QMainWindow):
         brand = QLabel("CODEX\nSESSION LEDGER")
         brand.setObjectName("brand")
         layout.addWidget(brand)
-        desc = QLabel("让每一次调用\n都有迹可循。")
-        desc.setObjectName("sideMuted")
-        layout.addWidget(desc)
         layout.addSpacing(30)
         self.nav = QListWidget()
         self.nav.setObjectName("navigation")
@@ -1319,9 +1431,6 @@ class LedgerWindow(QMainWindow):
         formula.setObjectName("sideButton")
         formula.clicked.connect(self.show_help)
         layout.addWidget(formula)
-        version = QLabel("OFFLINE · QT 6\nv1.0")
-        version.setObjectName("sideMuted")
-        layout.addWidget(version)
         return side
 
     def build_overview(self) -> QWidget:
@@ -1411,7 +1520,11 @@ class LedgerWindow(QMainWindow):
         self.recent_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in range(1, 6):
             self.recent_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        self.recent_table.setFixedHeight(183)
+        self.recent_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.recent_table.setColumnWidth(2, 116)
+        self.recent_table.setSortingEnabled(False)
+        self.recent_table.verticalHeader().setDefaultSectionSize(32)
+        self.recent_table.setFixedHeight(168)
         self.recent_table.setObjectName("compactTable")
         self.recent_table.doubleClicked.connect(self.open_selected_session)
         recent_layout.addWidget(self.recent_table)
@@ -1432,6 +1545,7 @@ class LedgerWindow(QMainWindow):
         table.horizontalHeader().setSectionsClickable(True)
         table.horizontalHeader().setStretchLastSection(False)
         table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
         return table
 
     def build_sessions_page(self) -> QWidget:
@@ -1439,16 +1553,19 @@ class LedgerWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 2, 0, 0)
         layout.setSpacing(12)
-        caption = QLabel("每个会话单独核算 · 双击查看模型拆分 · 点击表头排序")
-        caption.setObjectName("muted")
-        layout.addWidget(caption)
         self.session_table = self.create_table(
-            ["开始时间", "会话 / 工作目录", "模型", "任务轮次", "输入", "缓存输入", "缓存命中率", "输出", "API 调用", "估算费用"]
+            ["开始时间", "会话 / 工作目录", "模型", "任务轮次", "非缓存输入", "缓存输入", "缓存命中率", "输出", "API 调用", "估算费用"]
         )
-        self.session_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.session_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in range(2, 10):
-            self.session_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header = self.session_table.horizontalHeader()
+        header.setMinimumSectionSize(42)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        for column, width in ((1, 250), (2, 108)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(column, width)
+        header.moveSection(header.visualIndex(1), 0)
+        header.moveSection(header.visualIndex(9), 1)
+        header.setStretchLastSection(True)
+        header.setSortIndicator(0, Qt.SortOrder.DescendingOrder)
         self.session_table.doubleClicked.connect(self.open_selected_session)
         layout.addWidget(self.session_table, 1)
         self.session_summary = QLabel("")
@@ -1527,72 +1644,67 @@ class LedgerWindow(QMainWindow):
         if self.closing:
             return
         self.cancel_scan()
-        path = Path(self.source_edit.text().strip()).expanduser()
-        if not path.exists():
-            QMessageBox.warning(self, "路径不存在", f"请选择一个存在的目录或 .jsonl 文件：\n{path}")
-            return
-        self.root_path = path.resolve()
         self.scan_generation += 1
-        self.scan_cancelled = False
+        source = self.source_edit.text().strip()
+        if source.startswith('"') and source.endswith('"'):
+            source = source[1:-1]
+        if not source:
+            self.scan_failed("请输入目录路径，或选择一个 .jsonl 文件。")
+            self.source_edit.setFocus()
+            return
+        self.root_path = Path(source)
         self.set_scanning(True)
         thread = QThread(self)
         worker = ScanWorker(self.root_path)
         worker.moveToThread(thread)
-        self.scan_thread = thread
+        self.scan_threads[thread] = worker
         self.scan_worker = worker
-        scan_generation = self.scan_generation
-        thread.started.connect(worker.run)
-        worker.progressed.connect(self.update_progress)
-        worker.finished.connect(lambda result, generation=scan_generation: self.scan_finished(result, generation))
-        worker.failed.connect(lambda message, generation=scan_generation: self.scan_failed(message, generation))
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self.scan_thread_finished(thread, scan_generation))
-        self.progress.setRange(0, 0)
+        generation = self.scan_generation
+        thread.started.connect(worker.run, Qt.ConnectionType.QueuedConnection)
+        worker.progressed.connect(lambda current, total: self.update_progress(current, total, generation))
+        worker.finished.connect(lambda result: self.scan_finished(result, generation))
+        worker.failed.connect(lambda message: self.scan_failed(message, generation))
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda: self.scan_thread_finished(thread, generation))
         thread.start()
 
     def cancel_scan(self):
-        self.scan_cancelled = True
         if self.scan_worker:
             self.scan_worker.cancel()
-        if self.scan_thread and self.scan_thread.isRunning():
-            # 退出事件循环并不会中止正在执行的 run；需等待当前 JSONL 行处理结束。
-            self.scan_thread.wait(10000)
-        if self.scan_thread:
-            thread = self.scan_thread
-            if thread.isRunning():
-                while thread.isRunning():
-                    QApplication.processEvents()
-                    thread.wait(20)
-            thread.deleteLater()
-        self.scan_thread = None
         self.scan_worker = None
 
     def scan_thread_finished(self, thread: QThread, generation: int):
-        if self.scan_thread is thread and self.scan_generation == generation:
-            self.scan_thread = None
+        self.scan_threads.pop(thread, None)
+        if self.scan_generation == generation:
             self.scan_worker = None
         thread.deleteLater()
+        if self.closing and not self.scan_threads:
+            self.close()
 
-    def update_progress(self, current: int, total: int):
-        if self.scan_cancelled or self.closing:
+    def update_progress(self, current: int, total: int, generation: int):
+        if self.closing or generation != self.scan_generation:
             return
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(current)
         self.status.setText(f"正在读取 {current} / {total} 个文件…")
 
     def scan_failed(self, message: str, generation: int | None = None):
-        if self.scan_cancelled or self.closing or (generation is not None and generation != self.scan_generation):
+        if self.closing or (generation is not None and generation != self.scan_generation):
             return
+        self.scan_error = message
         self.set_scanning(False)
-        self.status.setText("扫描失败")
-        QMessageBox.critical(self, "无法读取会话", message)
+        self.status.setText("扫描失败 · 当前显示上次扫描结果" if self.sessions else "扫描失败")
+        self.status.setToolTip(html_escape(message))
+        self.scan_details_button.show()
+        self.update_empty_state()
 
     def scan_finished(self, result: ScanResult, generation: int | None = None):
-        if self.scan_cancelled or self.closing or (generation is not None and generation != self.scan_generation):
+        if self.closing or (generation is not None and generation != self.scan_generation):
             return
+        self.scan_report = result
+        self.scan_error = ""
         self.set_scanning(False)
         self.sessions = result.sessions
         selected = self.model_filter.currentData() or ""
@@ -1607,27 +1719,77 @@ class LedgerWindow(QMainWindow):
         self.model_filter.blockSignals(False)
         self.apply_filters()
         errors = result.parse_errors
-        self.status.setText(
-            f"已扫描 {len(result.sessions)} 个文件 · 本机时区 {datetime.now().astimezone().tzname()}"
-            + (f" · {len(errors)} 行异常" if errors else "")
-        )
+        no_usage = sum(not session.records for session in result.sessions)
+        subagents = sum(session.is_subagent for session in result.sessions)
+        parts = [f"{result.file_count} 个 JSONL", f"识别到 {len(result.sessions)} 个会话"]
+        if subagents:
+            parts.append(f"其中 {subagents} 个子智能体")
+        if no_usage:
+            parts.append(f"{no_usage} 个无用量")
+        if result.skipped_files:
+            parts.append(f"跳过 {result.skipped_files} 个文件")
         if errors:
-            self.status.setToolTip("\n".join(errors[:20]))
-        self.progress.setVisible(False)
+            parts.append(f"{len(errors)} 处读取或格式问题")
+        self.status.setText(" · ".join(parts))
+        self.status.setToolTip(f"本机时区 {datetime.now().astimezone().tzname()}")
+        self.scan_details_button.setVisible(bool(result.skipped_files or errors))
+
+    def show_scan_details(self):
+        sections = [f"扫描位置\n{self.root_path}"]
+        if self.scan_error:
+            sections.append(f"读取失败\n{self.scan_error}")
+        elif self.scan_report:
+            report = self.scan_report
+            if report.skipped:
+                sections.append(f"跳过的文件（{report.skipped_files}）\n" + "\n".join(report.skipped))
+            errors = report.parse_errors
+            if errors:
+                sections.append(f"读取或格式问题（{len(errors)}）\n" + "\n".join(errors))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("JSONL 扫描详情")
+        dialog.resize(760, 440)
+        layout = QVBoxLayout(dialog)
+        details = QPlainTextEdit("\n\n".join(sections))
+        details.setReadOnly(True)
+        layout.addWidget(details)
+        buttons = QDialogButtonBox()
+        buttons.addButton("关闭", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def set_scanning(self, scanning: bool):
+        self.is_scanning = scanning
         self.refresh_button.setText("正在扫描…" if scanning else "重新扫描")
         self.refresh_button.setEnabled(not scanning)
-        self.export_button.setEnabled(not scanning)
+        self.export_button.setEnabled(not scanning and bool(self.filtered))
         self.progress.setVisible(scanning)
         if scanning:
+            self.scan_details_button.hide()
+            self.empty_state.hide()
+            self.status.setToolTip("")
             self.progress.setRange(0, 0)
             self.status.setText("正在查找 JSONL 文件…")
 
+    def update_empty_state(self):
+        message = ""
+        if not self.is_scanning and not self.filtered:
+            if self.sessions:
+                message = "当前筛选没有匹配的会话。可调整日期、模型、会话类型或搜索词。"
+            elif self.scan_error:
+                message = "请选择可读取的 Codex sessions 目录或 JSONL 文件。"
+            elif self.scan_report:
+                message = (
+                    "识别到 0 个 Codex 会话。打开扫描详情查看各文件的识别结果。"
+                    if self.scan_report.file_count
+                    else "这里没有 JSONL 文件。请选择 Codex sessions 目录或单个 JSONL 文件。"
+                )
+        self.empty_state.setText(message)
+        self.empty_state.setVisible(bool(message))
+
     def period_changed(self):
         custom = self.period.currentText() == "自定义范围"
-        self.start_date.setVisible(custom)
-        self.end_date.setVisible(custom)
+        self.date_filter_bar.setVisible(custom)
         if self.sessions:
             dates = [record.timestamp.astimezone().date() for session in self.sessions for record in session.records]
             if dates:
@@ -1658,6 +1820,7 @@ class LedgerWindow(QMainWindow):
             end,
             self.model_filter.currentData() or "",
             self.search.text(),
+            subagent=self.session_kind_filter.currentData(),
         )
         self.refresh_data()
 
@@ -1666,14 +1829,13 @@ class LedgerWindow(QMainWindow):
         usage = sum((record.usage for record in records), Usage())
         cost, unpriced_tokens, unknown_models = aggregate_cost(records, self.config)
         self.total_card.update(
-            money(cost, self.config.currency_symbol),
+            money(cost, self.config.currency_symbol) if records else "—",
             f"{self.config.currency} · {len(self.filtered)} 个会话 · 用户价格估算",
         )
-        self.call_card.update(tokens(len(records)), "每个 token_usage_record 仅计一次")
+        self.call_card.update(tokens(len(records)), "来自新版与旧版用量记录")
         self.token_card.update(tokens(usage.total_tokens), f"输入 {tokens(usage.input_tokens)} + 输出 {tokens(usage.output_tokens)}")
         ceiling = cache_ceiling_many(session.records for session in self.filtered)
-        cache_rate = usage.cache_hit_rate * 100
-        self.cache_card.update(f"{cache_rate:.1f}%", f"缓存命中 {tokens(usage.cached_input_tokens)} tokens")
+        self.cache_card.update(cache_rate_text(usage), f"缓存命中 {tokens(usage.cached_input_tokens)} tokens")
         self.cache_card.setToolTip(
             f"实际 {ceiling.actual_rate:.1%}（{tokens(ceiling.actual_cached)} / {tokens(usage.input_tokens)}）\n"
             f"理论上限·只复用上一次输入：{ceiling.prompt_only_rate:.1%}\n"
@@ -1689,21 +1851,22 @@ class LedgerWindow(QMainWindow):
             else "—"
         )
         if unknown_models:
-            self.unpriced.setText(
+            price_warning = (
                 f"未定价：{'、'.join(sorted(unknown_models))}\n"
                 f"另有 {tokens(unpriced_tokens)} tokens 未计入支出。请配置对应模型。"
             )
-        elif any(
-            config.input == 0 and config.cached_input == 0 and config.output == 0
-            for config in self.config.models.values()
-        ):
-            self.unpriced.setText("部分模型价格仍为 0；当前金额仅按已填写的单价估算。")
         else:
-            self.unpriced.setText("所有已识别模型均已配置价格。")
+            model_prices = (self.config.find(model) for model in {record.model for record in records})
+            has_zero_price = any(price and price.input == price.cached_input == price.output == 0 for price in model_prices)
+            price_warning = "当前部分 API 调用按配置单价 0 计算。" if has_zero_price else ""
+        self.unpriced.setText(price_warning)
+        self.unpriced.setVisible(bool(price_warning))
         self.populate_recent()
         self.populate_sessions()
         self.populate_models()
         self.populate_days()
+        self.export_button.setEnabled(not self.is_scanning and bool(self.filtered))
+        self.update_empty_state()
 
     def session_values(self, session: Session):
         usage = session.usage
@@ -1712,63 +1875,66 @@ class LedgerWindow(QMainWindow):
 
     def session_cost_text(self, cost: Decimal, unpriced: int) -> str:
         if unpriced:
-            return f"≥ {money(cost, self.config.currency_symbol)} · 部分未定价"
+            return f"≥ {money(cost, self.config.currency_symbol)}"
         return money(cost, self.config.currency_symbol)
 
     def add_session_row(self, table: QTableWidget, row: int, session: Session, compact=False):
-        usage, cost, unpriced, unknown = self.session_values(session)
-        title = f"{session.title}   ·   {session.session_id[:8]}"
+        usage, cost, unpriced, _ = self.session_values(session)
+        title = session.title
+        if title != session.workspace:
+            title += f"  ·  {session.workspace}"
         name = table_item(title)
         name.setData(Qt.ItemDataRole.UserRole, session)
-        set_hover_html(
-            name,
-            tooltip_html([
-                ("工作目录", "#11745F", session.cwd or "（未知）"),
-                ("JSONL 文件", "#69777D", str(session.path)),
-            ]),
-        )
+        blocks = [
+            ("会话", "#11745F", session.title),
+            ("工作目录", MUTED, session.cwd or "—"),
+            ("会话 ID", MUTED, session.session_id),
+            ("JSONL 文件", MUTED, str(session.path)),
+        ]
+        if session.subagent and session.subagent.parent_thread_id:
+            blocks.append(("父会话 ID", MUTED, session.subagent.parent_thread_id))
+        if not session.records:
+            blocks.append(("用量", MUTED, "日志中暂无用量记录。"))
+        set_hover_html(name, tooltip_html(blocks))
+        cost_item = NumericItem(self.session_cost_text(cost, unpriced) if session.records else "—", cost)
+        if unpriced:
+            cost_item.setForeground(QColor("#AF5B32"))
+            cost_item.setToolTip(f"{tokens(unpriced)} tokens 未配置价格")
         if compact:
             values = [
                 name,
                 table_item(display_time(session.start)),
-                table_item("、".join(session.models) or "未知模型"),
+                model_names_item(session.models),
                 NumericItem(tokens(usage.total_tokens), usage.total_tokens),
                 cache_rate_item(usage, session.records),
-                NumericItem(self.session_cost_text(cost, unpriced), cost),
+                cost_item,
             ]
         else:
             values = [
                 table_item(display_time(session.start)),
                 name,
-                table_item("、".join(session.models) or "未知模型"),
+                model_names_item(session.models),
                 NumericItem(tokens(session.turn_count), session.turn_count),
                 NumericItem(tokens(usage.uncached_input_tokens), usage.uncached_input_tokens),
                 NumericItem(tokens(usage.cached_input_tokens), usage.cached_input_tokens),
                 cache_rate_item(usage, session.records),
                 output_item(usage),
                 NumericItem(tokens(len(session.records)), len(session.records)),
-                NumericItem(self.session_cost_text(cost, unpriced), cost),
+                cost_item,
             ]
         for column, item in enumerate(values):
-            if column == len(values) - 1 and unpriced:
-                item.setForeground(QColor("#AF5B32"))
             table.setItem(row, column, item)
 
     def populate_recent(self):
-        self.recent_table.setSortingEnabled(False)
-        self.recent_table.setRowCount(0)
-        for session in self.filtered[:4]:
-            row = self.recent_table.rowCount()
-            self.recent_table.insertRow(row)
+        recent = self.filtered[:4]
+        self.recent_table.setRowCount(len(recent))
+        for row, session in enumerate(recent):
             self.add_session_row(self.recent_table, row, session, compact=True)
-        self.recent_table.setSortingEnabled(True)
 
     def populate_sessions(self):
         self.session_table.setSortingEnabled(False)
-        self.session_table.setRowCount(0)
-        for session in self.filtered:
-            row = self.session_table.rowCount()
-            self.session_table.insertRow(row)
+        self.session_table.setRowCount(len(self.filtered))
+        for row, session in enumerate(self.filtered):
             self.add_session_row(self.session_table, row, session)
         self.session_table.setSortingEnabled(True)
         self.session_summary.setText(
@@ -1850,7 +2016,11 @@ class LedgerWindow(QMainWindow):
             return
         session = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(session, Session):
-            SessionDialog(session, self.config, self).exec()
+            parent_title = ""
+            if session.subagent and session.subagent.parent_thread_id:
+                parent_id = session.subagent.parent_thread_id
+                parent_title = next((entry.title for entry in self.sessions if entry.session_id == parent_id), "")
+            SessionDialog(session, self.config, self, parent_title=parent_title).exec()
 
     def edit_prices(self):
         dialog = PriceDialog(self.config, self.config_path, self)
@@ -1896,9 +2066,11 @@ class LedgerWindow(QMainWindow):
                     "开始时间", "结束时间", "会话ID", "工作目录", "模型", "任务轮次", "输入tokens",
                     "缓存输入tokens", "缓存命中率", "非缓存输入tokens", "输出tokens",
                     "其中思考tokens", "API调用数", "已定价费用", "货币", "未定价tokens", "JSONL文件",
+                    "会话类型", "父会话ID", "智能体名称", "智能体路径",
                 ])
                 for session in self.filtered:
                     usage, cost, unpriced, _ = self.session_values(session)
+                    agent = session.subagent
                     writer.writerow([
                         display_time(session.start), display_time(session.end), session.session_id,
                         session.cwd, "; ".join(session.models), session.turn_count, usage.input_tokens,
@@ -1907,6 +2079,8 @@ class LedgerWindow(QMainWindow):
                         usage.reasoning_output_tokens,
                         len(session.records), format(cost, "f"), self.config.currency,
                         unpriced, str(session.path),
+                        "子智能体" if agent else "主会话", agent.parent_thread_id if agent else "",
+                        agent.nickname if agent else "", agent.path if agent else "",
                     ])
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
@@ -1918,22 +2092,20 @@ class LedgerWindow(QMainWindow):
         # 侧栏先于主区域构建，初始化选中项时尚无 stack。
         if index < 0 or not hasattr(self, "stack"):
             return
+        if index != self.nav.currentRow():
+            self.nav.setCurrentRow(index)
+            return
         self.current_page = index
         self.stack.setCurrentIndex(index)
-        titles = [
-            ("费用总览", "本地会话 · 按 API 调用计价"),
-            ("会话明细", "逐份账本 · 精确到输入、缓存与输出"),
-            ("模型统计", "单价与用量 · 在同一处核对"),
-            ("每日统计", "本机自然日 · 查看使用趋势"),
-        ]
-        self.heading.setText(titles[index][0])
-        self.subtitle.setText(titles[index][1])
-        self.update_scroll_policy()
+        self.heading.setText(self.nav.item(index).text())
 
     def closeEvent(self, event: QCloseEvent):
         self.closing = True
         self.cancel_scan()
-        event.accept()
+        if self.scan_threads:
+            event.ignore()
+        else:
+            event.accept()
 
 
 STYLE = """
@@ -1943,7 +2115,6 @@ QWidget#centralwidget { background: #F3F6F7; }
 #sidebar { background: #1B2A30; }
 #brandMark { color: #7DD9BF; font-family: "Cascadia Mono", monospace; font-size: 20px; font-weight: 700; }
 #brand { color: #F2F6F5; font-family: "Cascadia Mono", monospace; font-size: 15px; font-weight: 700; line-height: 1.3; }
-#sideMuted { color: #8FA4AA; font-size: 11px; padding: 6px 0; }
 #sideDivider { background: #35464C; }
 #navigation { background: transparent; border: none; outline: none; padding: 0; }
 #navigation::item { color: #AFC0C5; border-radius: 7px; padding: 0 12px; }
@@ -1958,10 +2129,10 @@ QWidget#centralwidget { background: #F3F6F7; }
 #heroValue { color: #11745F; font-family: "Cascadia Mono", "Segoe UI", sans-serif; font-size: 29px; font-weight: 700; }
 #metricValue { color: #25353C; font-family: "Cascadia Mono", "Segoe UI", sans-serif; font-size: 21px; font-weight: 700; }
 #muted { color: #69777D; font-size: 12px; }
+#emptyState { color: #3B545B; background: #EDF5F3; border: 1px solid #D2E3DF; border-radius: 7px; padding: 9px 12px; }
 #warning { color: #A76036; font-size: 12px; background: #FFF5E9; border-radius: 5px; padding: 9px; }
 #breakdownValue { color: #3B4C53; font-family: "Cascadia Mono", "Segoe UI", sans-serif; font-size: 13px; }
 #breakdownKey { color: #69777D; font-size: 12px; }
-#folderIcon { color: #138A72; font-size: 24px; font-weight: 700; }
 QFrame#card, QFrame#filterBar { background: white; border: 1px solid #DFE5E7; border-radius: 10px; }
 QPushButton { min-height: 34px; padding: 0 14px; border-radius: 6px; font-weight: 600; }
 QPushButton#primaryButton { color: white; background: #138A72; border: 1px solid #138A72; }
@@ -1975,6 +2146,7 @@ QPushButton#iconButton { color: #7D888C; background: transparent; border: 1px so
 QPushButton:disabled { color: #8B989D; background: #D8E2DF; border-color: #D8E2DF; }
 QPushButton:focus, QLineEdit:focus, QComboBox:focus, QDateEdit:focus { border: 1px solid #138A72; }
 QLineEdit, QComboBox, QDateEdit { background: white; border: 1px solid #D7E0E2; border-radius: 6px; min-height: 34px; padding: 0 10px; selection-background-color: #BCE2D6; }
+QPlainTextEdit { background: white; border: 1px solid #DFE5E7; border-radius: 7px; selection-background-color: #BCE2D6; }
 QComboBox::drop-down, QDateEdit::drop-down { border: none; width: 25px; }
 QComboBox QAbstractItemView { background: white; border: 1px solid #D7E0E2; selection-background-color: #DDF1EB; selection-color: #1E2C32; padding: 4px; }
 QTableWidget { background: white; alternate-background-color: #F8FAFA; border: 1px solid #DFE5E7; border-radius: 8px; gridline-color: transparent; selection-background-color: #DFF1EB; selection-color: #1E2C32; }
@@ -2073,7 +2245,7 @@ light_title_bars = LightTitleBarFilter()
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Codex Session Ledger · Qt 6 本地 token 费用账本")
-    parser.add_argument("--sessions", type=Path, default=Path.home() / ".codex" / "sessions", help="sessions 目录或单个 JSONL 文件")
+    parser.add_argument("--sessions", type=Path, default=default_sessions_path(), help="sessions 目录或单个 JSONL 文件")
     parser.add_argument("--config", type=Path, default=default_config_path(), help="模型价格 JSON 配置")
     args = parser.parse_args(argv)
     app = QApplication(sys.argv[:1])

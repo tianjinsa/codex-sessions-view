@@ -16,6 +16,7 @@ from typing import Callable, Iterable
 
 ZERO = Decimal("0")
 MILLION = Decimal("1000000")
+UNKNOWN_MODEL = "未知模型"
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,11 @@ class ConfigError(ValueError):
 def default_config_path() -> Path:
     """随程序保存配置；打包后仍可写，并可用命令行覆盖路径。"""
     return Path(__file__).resolve().with_name("prices.json")
+
+
+def default_sessions_path() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home).expanduser() if home else Path.home() / ".codex") / "sessions"
 
 
 def load_config(path: Path | str = default_config_path()) -> PriceConfig:
@@ -232,6 +238,14 @@ class UsageRecord:
         return parts.total, parts
 
 
+@dataclass(frozen=True)
+class AgentMessage:
+    author: str
+    text: str
+    starts_turn: bool
+    line_number: int
+
+
 @dataclass
 class Turn:
     """一个任务轮次：从用户提问开始，到 GPT 完成或中断/异常结束为止。
@@ -253,6 +267,9 @@ class Turn:
     absorbed_auto_turns: int = 0
     # 任务进行中用户补充的消息；它们与首个提问共享 turn_id，不另算轮次。
     follow_ups: list[str] = field(default_factory=list)
+    reported_duration: float | None = None
+    parent_turn_id: str = ""
+    agent_messages: list[AgentMessage] = field(default_factory=list)
 
     @property
     def ended_unexpectedly(self) -> bool:
@@ -272,24 +289,26 @@ class Turn:
         return self.started_at or (self.records[0].timestamp if self.records else None)
 
     def title(self) -> str:
-        """优先用用户提问，其次用最终回复，最后才用 ID。"""
-        for text in (self.user_prompt, self.last_agent_message):
-            normalized = " ".join(text.split())
-            if normalized:
-                return normalized[:120] + ("…" if len(normalized) > 120 else "")
+        """用用户提问、委派任务或最终回复生成标题。"""
+        delegated = next((message.text for message in self.agent_messages if message.starts_turn), "")
+        for text in (self.user_prompt, delegated, self.last_agent_message):
+            summary = _summary(text, 120)
+            if summary:
+                return summary
         return f"轮次 {self.turn_id[:8]}" if self.turn_id else "未识别轮次"
 
     @property
     def duration_seconds(self) -> float | None:
         """任务从开始到完成/中断的墙钟时长；缺任一端时返回 None。"""
-        if self.started_at and self.completed_at:
-            return max(0.0, (self.completed_at - self.started_at).total_seconds())
+        if self.reported_duration is not None:
+            return self.reported_duration
+        if self.start and self.completed_at:
+            return max(0.0, (self.completed_at - self.start).total_seconds())
         return None
 
     def summary_text(self, limit: int = 64) -> str:
-        """表格里用的短标题；完整提问保留在 title() 和悬停提示中。"""
-        text = " ".join(self.title().split())
-        return text if len(text) <= limit else text[:limit] + "…"
+        """表格里用的短标题。"""
+        return _summary(self.title(), limit)
 
     @property
     def status_text(self) -> str:
@@ -501,6 +520,15 @@ def aggregate_cost_breakdown(
     return parts, unpriced
 
 
+@dataclass(frozen=True)
+class SubagentInfo:
+    parent_thread_id: str = ""
+    nickname: str = ""
+    path: str = ""
+    role: str = ""
+    depth: int | None = None
+
+
 @dataclass
 class Session:
     path: Path
@@ -510,14 +538,26 @@ class Session:
     records: list[UsageRecord]
     parse_errors: list[str]
     turns: list[Turn] = field(default_factory=list)
+    created_at: datetime | None = None
+    recognized: bool = True
+    first_prompt: str = ""
+    subagent: SubagentInfo | None = None
+
+    @property
+    def is_subagent(self) -> bool:
+        return self.subagent is not None
 
     @property
     def start(self) -> datetime | None:
-        return self.records[0].timestamp if self.records else None
+        if self.records:
+            return self.records[0].timestamp
+        return self.created_at or (self.turns[0].start if self.turns else None)
 
     @property
     def end(self) -> datetime | None:
-        return self.records[-1].timestamp if self.records else None
+        if self.records:
+            return self.records[-1].timestamp
+        return (self.turns[-1].completed_at or self.turns[-1].start) if self.turns else self.created_at
 
     @property
     def models(self) -> list[str]:
@@ -529,21 +569,39 @@ class Session:
 
     @property
     def turn_count(self) -> int:
-        return sum(1 for turn in self.turns if turn.records)
+        return len(self.turns)
 
     @property
     def title(self) -> str:
-        return Path(self.cwd).name if self.cwd else self.path.stem
+        if self.subagent:
+            name = self.subagent.nickname or self.subagent.path or self.session_id[:8]
+            return f"子智能体 · {name}"
+        prompt = self.first_prompt or (self.turns[0].user_prompt if self.turns else "")
+        return _summary(prompt, 120) or self.workspace
+
+    @property
+    def workspace(self) -> str:
+        return self.cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or self.path.stem
 
 
 @dataclass(frozen=True)
 class ScanResult:
     sessions: list[Session]
     skipped_files: int = 0
+    skipped: list[str] = field(default_factory=list)
+    file_errors: list[str] = field(default_factory=list)
+
+    @property
+    def file_count(self) -> int:
+        return len(self.sessions) + self.skipped_files
 
     @property
     def parse_errors(self) -> list[str]:
-        return [error for session in self.sessions for error in session.parse_errors]
+        return [
+            f"{session.path} · {error}"
+            for session in self.sessions
+            for error in session.parse_errors
+        ] + self.file_errors
 
 
 def sum_usage(usages: Iterable[Usage]) -> Usage:
@@ -554,240 +612,432 @@ def sum_usage(usages: Iterable[Usage]) -> Usage:
 
 
 def _timestamp(raw: object) -> datetime | None:
-    if not isinstance(raw, str):
-        return None
     try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
+        if isinstance(raw, str):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        if type(raw) is int:
+            return datetime.fromtimestamp(raw, timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        pass
+    return None
+
+
+def _text(data: dict, *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _subagent_info(payload: dict) -> SubagentInfo | None:
+    source = payload.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    spawn = spawn if isinstance(spawn, dict) else {}
+    parent_thread_id = _text(spawn, "parent_thread_id") or _text(payload, "parent_thread_id")
+    nickname = _text(spawn, "agent_nickname") or _text(payload, "agent_nickname")
+    path = _text(spawn, "agent_path") or _text(payload, "agent_path")
+    thread_source = _text(payload, "thread_source")
+    marked = isinstance(subagent, (dict, str)) or source == "subagent" or thread_source == "subagent"
+    if not marked and (thread_source == "user" or not (parent_thread_id and (path or nickname))):
         return None
-    return parsed
+    depth = spawn.get("depth", payload.get("depth"))
+    return SubagentInfo(
+        parent_thread_id=parent_thread_id,
+        nickname=nickname,
+        path=path,
+        role=_text(spawn, "agent_role") or _text(payload, "agent_role"),
+        depth=depth if type(depth) is int and depth >= 0 else None,
+    )
 
 
-def _clean_prompt(text: str) -> str:
-    """去掉用户文本里的 Markdown 转义反斜杠与多余空白，便于列表辨认。"""
-    cleaned = text.replace("\\#", "#").replace("\\*", "*").replace("\\`", "`")
-    cleaned = cleaned.replace("\\:", ":").replace("\\/", "/").replace("\\_", "_")
-    cleaned = cleaned.replace("\\-", "-").replace("\\[", "[").replace("\\]", "]")
-    return " ".join(cleaned.split())
+def _summary(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _user_prompt_text(content: object) -> str:
-    """从 content 数组中取出真正由用户输入的文本，忽略环境与指令注入块。"""
+def _message_text(content: object, *, user: bool = False) -> str:
+    """保留对话换行，过滤响应历史中的环境与指令注入块。"""
+    if isinstance(content, str):
+        content = [{"text": content}]
     if not isinstance(content, list):
         return ""
-    chunks: list[str] = []
+    chunks = []
     for chunk in content:
         if not isinstance(chunk, dict):
+            continue
+        if user and chunk.get("type") in ("input_image", "image", "local_image"):
+            chunks.append("［图片］")
             continue
         text = chunk.get("text")
         if not isinstance(text, str) or not text.strip():
             continue
-        stripped = text.strip()
-        if stripped.startswith("<environment_context>") or stripped.startswith("<user_instructions>"):
+        if user and text.lstrip().startswith(("<environment_context>", "<user_instructions>", "# AGENTS.md instructions")):
             continue
-        if stripped.startswith("# AGENTS.md instructions"):
-            continue
-        chunks.append(stripped)
-    return _clean_prompt("\n".join(chunks))
+        chunks.append(text)
+    return "\n".join(chunks)
 
 
-def parse_session(path: Path | str) -> Session:
-    """逐行解析大文件；仅保留用量记录，不在内存保存对话内容。"""
+@dataclass(frozen=True)
+class _Prompt:
+    source: str
+    message_id: str
+    text: str
+    timestamp: datetime | None
+    line_number: int
+
+
+def _merge_prompts(messages: list[_Prompt]) -> list[str]:
+    """合并相邻格式的消息回显，保留用户实际发送的重复消息。"""
+    prompts: list[tuple[_Prompt, set[str]]] = []
+    seen_ids: set[tuple[str, str]] = set()
+    for message in messages:
+        identity = (message.source, message.message_id)
+        if message.message_id:
+            if identity in seen_ids:
+                continue
+            seen_ids.add(identity)
+        match = None
+        for previous, sources in reversed(prompts):
+            if message.line_number - previous.line_number > 24:
+                break
+            if message.source in sources or message.text.strip() != previous.text.strip():
+                continue
+            if message.timestamp and previous.timestamp:
+                if abs((message.timestamp - previous.timestamp).total_seconds()) > 5:
+                    continue
+            match = sources
+            break
+        if match is None:
+            prompts.append((message, {message.source}))
+        else:
+            match.add(message.source)
+    return [message.text for message, _ in prompts]
+
+
+def _legacy_delta(current: Usage, previous: Usage | None) -> Usage:
+    if previous is None or (
+        current.input_tokens < previous.input_tokens or current.output_tokens < previous.output_tokens
+    ):
+        return current
+    return Usage(
+        current.input_tokens - previous.input_tokens,
+        current.cached_input_tokens - previous.cached_input_tokens
+        if current.cached_input_tokens >= previous.cached_input_tokens
+        else current.cached_input_tokens,
+        current.output_tokens - previous.output_tokens,
+        max(0, current.reasoning_output_tokens - previous.reasoning_output_tokens),
+    )
+
+
+def _deduplicate_usage(
+    records: list[UsageRecord],
+    legacy_lines: dict[int, tuple[str, Usage | None]],
+    replayed_lines: set[int],
+    root_turns: dict[str, str],
+) -> list[UsageRecord]:
+    """只把旧事件与此前尚未匹配的新版用量一对一配对。"""
+    unmatched: dict[Usage, list[UsageRecord]] = {}
+    matched_snapshot: tuple[str, Usage, Usage] | None = None
+    kept = []
+    for record in records:
+        if record.after_compaction:
+            unmatched.clear()
+            matched_snapshot = None
+        if record.line_number not in legacy_lines:
+            unmatched.setdefault(record.usage, []).append(record)
+            matched_snapshot = None
+        else:
+            turn_id, total = legacy_lines[record.line_number]
+            snapshot = (turn_id, total, record.usage) if total is not None else None
+            # 向子智能体递送消息时，日志可能再次发布上一个调用的同一份累计快照。
+            if snapshot is not None and snapshot == matched_snapshot:
+                continue
+            candidates = unmatched.get(record.usage, [])
+            nearest = None
+            delay = 120.0
+            for index in range(len(candidates) - 1, -1, -1):
+                candidate = candidates[index]
+                if turn_id and turn_id not in (candidate.turn_id, root_turns.get(candidate.turn_id)):
+                    continue
+                distance = abs((candidate.timestamp - record.timestamp).total_seconds())
+                if distance <= delay:
+                    nearest, delay = index, distance
+                    if distance == 0:
+                        break
+            if nearest is not None:
+                candidates.pop(nearest)
+                if not candidates:
+                    del unmatched[record.usage]
+                matched_snapshot = snapshot
+                continue
+            matched_snapshot = None
+        if record.line_number not in replayed_lines:
+            kept.append(record)
+    return kept
+
+
+class _ScanCancelled(Exception):
+    pass
+
+
+def parse_session(
+    path: Path | str, *, cancelled: Callable[[], bool] | None = None
+) -> Session:
+    """逐行识别 Codex 事件，保留用量和任务的提问、补充与最终回复。"""
     path = Path(path)
     records: list[UsageRecord] = []
     errors: list[str] = []
     model_by_turn: dict[str, str] = {}
-    active_model = "未知模型"
+    first_model_by_turn: dict[str, str] = {}
+    inferred_models: set[int] = set()
+    root_turns: dict[str, str] = {}
+    active_model = UNKNOWN_MODEL
+    active_turn = ""
     session_id = path.stem
-    cwd = ""
-    source = ""
+    cwd = source = ""
+    created_at = None
+    subagent = None
+    recognized = False
     seen_responses: set[str] = set()
-    # 旧版 token_count 的累计值以 (会话, turn, 模型) 隔离，遇到回退则重新累计。
-    legacy_totals: dict[tuple[str, str], Usage] = {}
-    modern_lines: set[int] = set()
-    legacy_lines: list[int] = []
+    seen_agent_messages: set[str] = set()
+    replayed_lines: set[int] = set()
+    legacy_total: Usage | None = None
+    legacy_lines: dict[int, tuple[str, Usage | None]] = {}
     turn_meta: dict[str, Turn] = {}
-    # 压缩后的第一条请求无法复用压缩前的上下文。
-    compaction_seen = False
+    prompts: dict[str, list[_Prompt]] = {}
+    pending_prompts: list[_Prompt] = []
     pending_compaction = False
+    agent_message_starts_turn = False
 
-    def turn_span(turn_id: str) -> Turn | None:
-        if not turn_id:
-            return None
-        return turn_meta.setdefault(turn_id, Turn(turn_id=turn_id, records=[]))
+    def turn_span(turn_id: str) -> Turn:
+        if turn_id not in turn_meta:
+            turn_meta[turn_id] = Turn(turn_id=turn_id, records=[])
+        return turn_meta[turn_id]
 
-    with path.open("r", encoding="utf-8-sig") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
+    with path.open("rb") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if cancelled and cancelled():
+                raise _ScanCancelled
+            if not raw.strip():
                 continue
             try:
+                line = raw.decode("utf-8-sig" if line_number == 1 else "utf-8")
+                if not line.strip():
+                    continue
                 event = json.loads(line)
+            except UnicodeDecodeError:
+                errors.append(f"第 {line_number} 行：含有无效的 UTF-8 字节")
+                continue
             except json.JSONDecodeError as exc:
                 errors.append(f"第 {line_number} 行：JSON 无法解析（{exc.msg}）")
                 continue
-            if not isinstance(event, dict):
+            except (ValueError, RecursionError):
+                errors.append(f"第 {line_number} 行：JSON 超出解析限制")
                 continue
-            payload = event.get("payload")
-            if not isinstance(payload, dict):
+            if not isinstance(event, dict) or not isinstance(event.get("payload"), dict):
                 continue
-            kind = event.get("type")
+            payload = event["payload"]
+            kind = _text(event, "type")
+            if kind == "inter_agent_communication_metadata":
+                agent_message_starts_turn = payload.get("trigger_turn") is True
+                continue
+            starts_turn, agent_message_starts_turn = agent_message_starts_turn, False
+            event_type = _text(payload, "type") if kind == "event_msg" else ""
+            response_message = kind == "response_item" and payload.get("type") == "message"
+            agent_message = subagent is not None and kind == "response_item" and payload.get("type") == "agent_message"
+            if (
+                kind not in {"session_meta", "turn_context", "token_usage_record", "compacted"}
+                and event_type not in {
+                    "task_started", "task_complete", "turn_aborted", "context_compacted",
+                    "user_message", "agent_message", "item_completed", "token_count",
+                }
+                and not (response_message or agent_message)
+            ):
+                continue
 
+            recognized = True
+            timestamp = _timestamp(event.get("timestamp")) or _timestamp(payload.get("timestamp"))
             if kind == "session_meta":
-                session_id = str(payload.get("id") or payload.get("session_id") or session_id)
-                cwd = str(payload.get("cwd") or "")
-                source = str(payload.get("originator") or payload.get("source") or "")
-            elif kind == "turn_context":
-                model = payload.get("model")
-                if isinstance(model, str) and model:
+                session_id = _text(payload, "id", "session_id") or session_id
+                cwd = _text(payload, "cwd") or cwd
+                source = _text(payload, "originator", "source") or source
+                subagent = _subagent_info(payload) or subagent
+                created_at = created_at or _timestamp(payload.get("timestamp")) or timestamp
+                active_model = _text(payload, "model") or active_model
+                continue
+            if kind == "compacted" or event_type == "context_compacted":
+                pending_compaction = True
+                continue
+
+            metadata = payload.get("internal_chat_message_metadata_passthrough")
+            root_turn = _text(payload, "root_turn_id")
+            explicit_turn = _text(payload, "turn_id")
+            if not explicit_turn and isinstance(metadata, dict):
+                explicit_turn = _text(metadata, "turn_id", "root_turn_id")
+            explicit_turn = explicit_turn or root_turn
+            if root_turn and explicit_turn != root_turn:
+                root_turns[explicit_turn] = root_turn
+            if explicit_turn and (kind == "turn_context" or event_type == "task_started"):
+                active_turn = explicit_turn
+            if explicit_turn and pending_prompts:
+                prompts.setdefault(explicit_turn, []).extend(pending_prompts)
+                pending_prompts.clear()
+                active_turn = active_turn or explicit_turn
+            turn_id = explicit_turn or active_turn
+
+            if agent_message and subagent:
+                author = _text(payload, "author")
+                recipient = _text(payload, "recipient")
+                if not turn_id or not author or not recipient or author == recipient:
+                    continue
+                if recipient not in (subagent.path, session_id):
+                    continue
+                message_id = _text(payload, "id")
+                if message_id and message_id in seen_agent_messages:
+                    continue
+                text = _message_text(payload.get("content"))
+                if text.startswith("Message Type:"):
+                    headers, separator, body = text.partition("\nPayload:")
+                    if separator:
+                        starts_turn = starts_turn or headers.splitlines()[0] == "Message Type: NEW_TASK"
+                        text = body.removeprefix(" ").removeprefix("\n")
+                if text.strip():
+                    turn_span(turn_id).agent_messages.append(AgentMessage(author, text, starts_turn, line_number))
+                    if message_id:
+                        seen_agent_messages.add(message_id)
+                continue
+
+            if kind == "turn_context":
+                model = _text(payload, "model")
+                if model:
                     active_model = model
-                    turn_id = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
                     if turn_id:
                         model_by_turn[turn_id] = model
-            elif kind == "compacted":
-                # 新版本遇到压缩后会重置累计 token_count；record 型用量不受影响。
-                legacy_totals.clear()
-                compaction_seen = True
-                pending_compaction = True
-
-            # 轮次边界：task_started / task_complete / turn_aborted 都带 turn_id。
-            # 旧版 CLI 还会把用户与 agent 文本回显为 event_msg，这里只取摘要文本。
-            if kind == "event_msg":
-                event_type = payload.get("type")
-                event_turn_id = str(payload.get("turn_id") or payload.get("root_turn_id") or "")
-                span = turn_span(event_turn_id)
-                if event_type == "task_started" and span:
-                    span.started_at = _timestamp(event.get("timestamp")) or span.started_at
-                elif event_type == "task_complete" and span:
-                    span.completed_at = _timestamp(event.get("timestamp")) or span.completed_at
-                    span.outcome = "completed"
-                    message = payload.get("last_agent_message")
-                    if isinstance(message, str) and message.strip():
-                        span.last_agent_message = _clean_prompt(message)
-                elif event_type == "turn_aborted" and span:
-                    span.aborted = True
-                    span.outcome = "aborted"
-                    span.completed_at = _timestamp(event.get("timestamp")) or span.completed_at
-                elif event_type == "user_message" and span:
-                    message = payload.get("message")
-                    if isinstance(message, str) and message.strip():
-                        prompt = _clean_prompt(message)
-                        if not span.user_prompt:
-                            span.user_prompt = prompt
-                        elif prompt not in span.follow_ups:
-                            span.follow_ups.append(prompt)
-
-            if kind == "response_item" and payload.get("type") == "message":
-                # 分页模式（0.147+）不写 user_message 回显，用户提问只在 response_item 中。
-                if payload.get("role") == "user":
-                    metadata = payload.get("internal_chat_message_metadata_passthrough")
-                    metadata = metadata if isinstance(metadata, dict) else {}
-                    message_turn_id = str(metadata.get("turn_id") or "")
-                    prompt = _user_prompt_text(payload.get("content"))
-                    span = turn_span(message_turn_id)
-                    if span and prompt:
-                        if not span.user_prompt:
-                            span.user_prompt = prompt
-                        else:
-                            # 同一 turn_id 的后续消息是任务进行中的补充，不算新轮次。
-                            span.follow_ups.append(prompt)
-
-            timestamp = _timestamp(event.get("timestamp"))
-            usage = None
-            response_id = ""
-            turn_id = str(payload.get("turn_id") or "")
-            record_key: tuple[str, str] | None = None
-
-            if kind == "token_usage_record" and isinstance(payload.get("usage"), dict):
-                # usage 是本次 API 调用；turn_token_usage 和 thread_token_usage 都是累计快照，不能累加。
-                usage = Usage.from_dict(payload["usage"])
-                response_id = str(payload.get("response_id") or "")
-                if response_id and response_id in seen_responses:
+                        first_model_by_turn.setdefault(turn_id, model)
+                continue
+            if event_type in {"task_started", "task_complete", "turn_aborted"}:
+                if not turn_id and pending_prompts and event_type != "task_started":
+                    turn_id = f"line-{pending_prompts[0].line_number}"
+                    prompts[turn_id] = pending_prompts.copy()
+                    pending_prompts.clear()
+                if not turn_id:
                     continue
-                if response_id:
-                    seen_responses.add(response_id)
-                modern_lines.add(line_number)
-            elif (
-                kind == "event_msg"
-                and payload.get("type") == "token_count"
-                and isinstance(payload.get("info"), dict)
-            ):
-                info = payload["info"]
-                if isinstance(info.get("last_token_usage"), dict):
-                    usage = Usage.from_dict(info["last_token_usage"])
-                elif isinstance(info.get("total_token_usage"), dict):
-                    current = Usage.from_dict(info["total_token_usage"])
-                    turn_key = turn_id or "default"
-                    record_key = (turn_key, active_model)
-                    previous = legacy_totals.get(record_key, Usage())
-                    # total_token_usage 是快照。若新值变小，说明上下文被压缩/重置。
-                    # 缓存项可能在新一轮重建而减少；以总输入/输出回退判断快照重置。
-                    if (
-                        current.input_tokens >= previous.input_tokens
-                        and current.output_tokens >= previous.output_tokens
-                    ):
-                        usage = Usage(
-                            current.input_tokens - previous.input_tokens,
-                            current.cached_input_tokens
-                            if current.cached_input_tokens < previous.cached_input_tokens
-                            else current.cached_input_tokens - previous.cached_input_tokens,
-                            current.output_tokens - previous.output_tokens,
-                        )
-                    legacy_totals[record_key] = current
-                if record_key is None:
-                    record_key = (turn_id or "default", active_model)
+                span = turn_span(turn_id)
+                if event_type == "task_started":
+                    span.started_at = span.started_at or timestamp or _timestamp(payload.get("started_at"))
+                    attribution = payload.get("turn_attribution")
+                    if isinstance(attribution, dict):
+                        span.parent_turn_id = _text(attribution, "parent_turn_id") or span.parent_turn_id
+                else:
+                    span.completed_at = timestamp or _timestamp(payload.get("completed_at")) or span.completed_at
+                    span.started_at = span.started_at or _timestamp(payload.get("started_at"))
+                    span.aborted = event_type == "turn_aborted"
+                    span.outcome = "aborted" if span.aborted else "completed"
+                    duration_ms = payload.get("duration_ms")
+                    if type(duration_ms) is int and 0 <= duration_ms < 2**64:
+                        span.reported_duration = duration_ms / 1000
+                    message = _message_text(payload.get("last_agent_message"))
+                    if message:
+                        span.last_agent_message = message
+                    if active_turn == turn_id:
+                        active_turn = ""
+                continue
 
-            if usage is None or not any(
-                (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
-            ):
+            item = payload.get("item") if event_type == "item_completed" else payload
+            item = item if isinstance(item, dict) else {}
+            role = payload.get("role") if response_message else None
+            if event_type == "user_message" or role == "user" or item.get("type") in ("UserMessage", "userMessage"):
+                content = payload.get("message") if event_type == "user_message" else item.get("content")
+                message = _message_text(content, user=True)
+                if not message and event_type == "user_message" and (payload.get("images") or payload.get("local_images")):
+                    message = "［图片］"
+                if message:
+                    message_id = _text(item, "client_id", "message_id", "id")
+                    prompt = _Prompt(event_type or kind, message_id, message, timestamp, line_number)
+                    if turn_id:
+                        prompts.setdefault(turn_id, []).append(prompt)
+                        active_turn = active_turn or turn_id
+                    else:
+                        pending_prompts.append(prompt)
+                continue
+            if turn_id and item.get("phase") in ("final_answer", "finalAnswer"):
+                if event_type == "agent_message" or role == "assistant" or item.get("type") in ("AgentMessage", "agentMessage"):
+                    span = turn_span(turn_id)
+                    message = _message_text(item.get("text") or item.get("content") or item.get("message"))
+                    if message and (span.outcome != "completed" or not span.last_agent_message):
+                        span.last_agent_message = message
+                continue
+
+            model = _text(payload, "model")
+            response_id = ""
+            if kind == "token_usage_record":
+                raw_usage = payload.get("usage")
+                if not isinstance(raw_usage, dict):
+                    continue
+                usage = Usage.from_dict(raw_usage)
+                response_id = _text(payload, "response_id")
+            elif event_type == "token_count" and isinstance(payload.get("info"), dict):
+                info = payload["info"]
+                last, total = info.get("last_token_usage"), info.get("total_token_usage")
+                current = Usage.from_dict(total) if isinstance(total, dict) else None
+                if isinstance(last, dict):
+                    usage = Usage.from_dict(last)
+                elif current is not None:
+                    usage = _legacy_delta(current, legacy_total)
+                else:
+                    continue
+                legacy_total = current if current is not None else (legacy_total or Usage()) + usage
+                model = model or _text(info, "model")
+            else:
+                continue
+
+            if not (usage.total_tokens or usage.cached_input_tokens):
                 continue
             if timestamp is None:
                 errors.append(f"第 {line_number} 行：用量记录缺少有效时间戳，已跳过")
                 continue
-            model = model_by_turn.get(turn_id, active_model)
-            if line_number not in modern_lines:
-                legacy_lines.append(len(records))
-            records.append(
-                UsageRecord(
-                    timestamp=timestamp,
-                    model=model,
-                    turn_id=turn_id,
-                    response_id=response_id or f"line-{line_number}",
-                    usage=usage,
-                    line_number=line_number,
-                    after_compaction=pending_compaction,
-                )
-            )
-            pending_compaction = False
+            replayed = bool(response_id and response_id in seen_responses)
+            if replayed:
+                replayed_lines.add(line_number)
+            elif response_id:
+                seen_responses.add(response_id)
+            if event_type == "token_count":
+                legacy_lines[line_number] = explicit_turn, current
+            specific_model = model or model_by_turn.get(turn_id) or model_by_turn.get(root_turn)
+            if not specific_model and turn_id:
+                inferred_models.add(line_number)
+            records.append(UsageRecord(
+                timestamp=timestamp,
+                model=specific_model or active_model,
+                turn_id=turn_id,
+                response_id=response_id or f"line-{line_number}",
+                usage=usage,
+                line_number=line_number,
+                after_compaction=pending_compaction and not replayed,
+            ))
+            if not replayed:
+                pending_compaction = False
 
-    if modern_lines and legacy_lines:
-        # 过渡期日志常把同一次调用同时写为 record 和 event_msg。
-        # 按用量、邻近时间一对一匹配，不能把文件前段仅有的旧事件一起丢弃。
-        legacy_indices = set(legacy_lines)
-        unmatched_modern: dict[Usage, list[UsageRecord]] = {}
+    if pending_prompts:
+        prompts[f"line-{pending_prompts[0].line_number}"] = pending_prompts
+    for turn_id, messages in prompts.items():
+        span = turn_span(turn_id)
+        span.user_prompt, *span.follow_ups = _merge_prompts(messages)
+        span.started_at = span.started_at or next(
+            (message.timestamp for message in messages if message.timestamp), None
+        )
+    if legacy_lines and len(legacy_lines) != len(records):
+        records = _deduplicate_usage(records, legacy_lines, replayed_lines, root_turns)
+    elif replayed_lines:
+        records = [record for record in records if record.line_number not in replayed_lines]
+    if inferred_models:
         for index, record in enumerate(records):
-            if index not in legacy_indices:
-                unmatched_modern.setdefault(record.usage, []).append(record)
-        duplicates: set[int] = set()
-        for index in legacy_indices:
-            legacy = records[index]
-            candidates = [
-                candidate
-                for candidate in unmatched_modern.get(legacy.usage, [])
-                if candidate.line_number < legacy.line_number
-            ]
-            nearest = min(
-                range(len(candidates)),
-                key=lambda position: abs((candidates[position].timestamp - legacy.timestamp).total_seconds()),
-                default=-1,
-            )
-            if nearest >= 0 and abs(
-                (candidates[nearest].timestamp - legacy.timestamp).total_seconds()
-            ) <= 120:
-                duplicates.add(index)
-                candidates.pop(nearest)
-        records = [record for index, record in enumerate(records) if index not in duplicates]
+            if record.line_number in inferred_models and record.turn_id in first_model_by_turn:
+                records[index] = replace(record, model=first_model_by_turn[record.turn_id])
     records.sort(key=lambda record: (record.timestamp, record.line_number))
-    turns = _group_turns(turn_meta, records)
+    turns = _group_turns(turn_meta, records, root_turns, subagent=subagent is not None)
     return Session(
         path=path.resolve(),
         session_id=session_id,
@@ -796,90 +1046,67 @@ def parse_session(path: Path | str) -> Session:
         records=records,
         parse_errors=errors,
         turns=turns,
+        created_at=created_at,
+        recognized=recognized,
+        first_prompt=turns[0].user_prompt if turns else "",
+        subagent=subagent,
     )
 
 
-def _group_turns(turn_meta: dict[str, Turn], records: list[UsageRecord]) -> list[Turn]:
-    """把用量归到 turn_id；没有 turn_id 的记录按时间并入最近的已知轮次。
-
-    只返回任务轮次：一次用户提问开启、直到完成或异常结束为止。
-    没有任何用户提问的轮次（纯工具续跑、自动压缩、中断的空会话）不计为任务。
-    """
-    spans: dict[str, Turn] = {}
-    for turn_id, span in turn_meta.items():
-        spans[turn_id] = Turn(
-            turn_id=turn_id,
-            records=[],
-            started_at=span.started_at,
-            completed_at=span.completed_at,
-            user_prompt=span.user_prompt,
-            last_agent_message=span.last_agent_message,
-            aborted=span.aborted,
-            outcome=span.outcome,
-            follow_ups=list(span.follow_ups),
-        )
+def _group_turns(
+    spans: dict[str, Turn],
+    records: list[UsageRecord],
+    root_turns: dict[str, str],
+    *,
+    subagent: bool = False,
+) -> list[Turn]:
+    """按任务 ID 归属用量，旧日志中缺 ID 的请求按时间归属。"""
+    unassigned = []
     for record in records:
-        turn_id = record.turn_id or ""
-        if turn_id:
-            span = spans.get(turn_id)
+        if record.turn_id:
+            span = spans.get(record.turn_id)
             if span is None:
-                span = Turn(turn_id=turn_id, records=[])
-                spans[turn_id] = span
+                span = spans[record.turn_id] = Turn(record.turn_id, [])
             span.records.append(record)
-            continue
-        # 早期日志可能没有 turn_id，用与已有轮次的时间距离归并，避免凭空多出一轮。
-        if spans:
-            owner = min(
-                spans.values(),
-                key=lambda span: _turn_distance(span, record.timestamp),
-            )
+        else:
+            unassigned.append(record)
+    if subagent and unassigned and not spans:
+        spans[""] = Turn("", [])
+    ordered = sorted(spans.values(), key=_turn_start, reverse=True)
+    for record in unassigned:
+        owner = min(ordered, key=lambda span: _turn_distance(span, record.timestamp), default=None)
+        if owner:
             owner.records.append(record)
-            continue
-        spans.setdefault("", Turn(turn_id="", records=[])).records.append(record)
-    _absorb_auto_turns(spans)
-    result = []
+    if subagent:
+        # 子智能体由父会话委派，日志通常只有执行边界和回复。
+        tasks = [
+            span for span in spans.values()
+            if span.user_prompt or span.started_at or span.outcome != "unfinished" or span.parent_turn_id
+            or any(message.starts_turn for message in span.agent_messages)
+        ]
+        if not tasks:
+            tasks = [span for span in spans.values() if span.records]
+    else:
+        tasks = [span for span in spans.values() if span.user_prompt]
+    tasks.sort(key=_turn_start)
+    tasks_by_id = {task.turn_id: task for task in tasks}
     for span in spans.values():
-        if not span.records:
+        if span.turn_id in tasks_by_id or not tasks:
             continue
-        span.records.sort(key=lambda record: (record.timestamp, record.line_number))
-        result.append(span)
-    result.sort(key=lambda span: span.start or datetime.min.replace(tzinfo=timezone.utc))
-    return result
-
-
-def _is_task_turn(span: Turn) -> bool:
-    """只有带真实用户提问的轮次才算任务轮次。"""
-    return bool(span.user_prompt.strip())
-
-
-def _absorb_auto_turns(spans: dict[str, Turn]) -> None:
-    """把纯模型内部循环（工具续跑、自动压缩、无提问子轮）并入它所属的任务轮。
-
-    这样既不会把内部轮冒充成任务轮，也不会丢失这些轮次真实产生的 token 费用。
-    """
-    tasks = [span for span in spans.values() if span.user_prompt.strip()]
-    if not tasks:
-        # 整份日志没有任何用户提问（如中断的空会话），不把内部轮冒充成任务轮。
-        spans.clear()
-        return
-    tasks.sort(key=lambda span: span.start or datetime.min.replace(tzinfo=timezone.utc))
-    for turn_id, span in list(spans.items()):
-        if span.user_prompt.strip():
-            continue
-        owner = _owner_task(tasks, span)
+        owner = tasks_by_id.get(root_turns.get(span.turn_id, "")) or _owner_task(tasks, span)
         if owner is None:
             continue
-        for record in span.records:
-            owner.records.append(replace(record, turn_id=owner.turn_id or record.turn_id))
+        owner.records.extend(span.records)
+        owner.agent_messages.extend(span.agent_messages)
         owner.absorbed_auto_turns += 1
-        owner.follow_ups.extend(span.follow_ups)
-        if span.aborted:
-            owner.aborted = True
-        if span.outcome in {"aborted", "interrupted"}:
-            owner.outcome = span.outcome
-        if span.completed_at and (owner.completed_at is None or span.completed_at > owner.completed_at):
-            owner.completed_at = span.completed_at
-        del spans[turn_id]
+    for task in tasks:
+        task.records.sort(key=lambda record: (record.timestamp, record.line_number))
+        task.agent_messages.sort(key=lambda message: message.line_number)
+    return tasks
+
+
+def _turn_start(span: Turn) -> datetime:
+    return span.start or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _owner_task(tasks: list[Turn], span: Turn) -> Turn | None:
@@ -895,58 +1122,63 @@ def _owner_task(tasks: list[Turn], span: Turn) -> Turn | None:
 
 def _turn_distance(span: Turn, moment: datetime) -> float:
     """记录离轮次区间有多近，用于无 turn_id 日志的归并。"""
-    if span.started_at and span.completed_at:
-        if span.started_at <= moment <= span.completed_at:
-            return 0.0
-        if moment < span.started_at:
-            return (span.started_at - moment).total_seconds()
-    if span.records:
-        if moment < span.records[0].timestamp:
-            return (span.records[0].timestamp - moment).total_seconds()
-        return (moment - span.records[-1].timestamp).total_seconds()
-    return float("inf")
+    if span.start is None:
+        return float("inf")
+    end = span.completed_at or span.start
+    return max(0.0, (span.start - moment).total_seconds(), (moment - end).total_seconds())
 
 
-def discover_jsonl(root: Path | str) -> tuple[list[Path], int]:
-    """自动处理 .codex/sessions 父目录，避免重复或错误扫描归档。"""
+def discover_jsonl(
+    root: Path | str, *, cancelled: Callable[[], bool] | None = None
+) -> list[Path]:
+    """查找 JSONL 文件。选择 Codex 主目录时只扫描其中的 sessions。"""
     root = Path(root).expanduser().resolve()
     if root.is_file():
-        return ([root] if root.suffix.lower() == ".jsonl" else []), 0
+        return [root] if root.suffix.lower() == ".jsonl" else []
     if not root.is_dir():
         raise FileNotFoundError(f"目录不存在：{root}")
-    candidates = [root]
-    if root.name.lower() == ".codex" and (root / "sessions").is_dir():
-        candidates = [root / "sessions"]
-    # 归档目录不会自动加入，避免与正常归档副本重复。
+    if (root.name.lower() == ".codex" or root == default_sessions_path().parent.resolve()) and (
+        root / "sessions"
+    ).is_dir():
+        root /= "sessions"
     paths: list[Path] = []
-    for candidate in candidates:
-        paths.extend(candidate.rglob("*.jsonl"))
-    return sorted(set(paths), key=lambda p: str(p).lower()), 0
+    for folder, _, files in os.walk(root):
+        if cancelled and cancelled():
+            break
+        paths.extend(Path(folder, name) for name in files if name.lower().endswith(".jsonl"))
+    return sorted(paths, key=lambda path: (str(path).casefold(), str(path)))
 
 
 def scan_sessions(
     root: Path | str,
     progress: Callable[[int, int], bool] | None = None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> ScanResult:
-    paths, skipped = discover_jsonl(root)
+    paths = discover_jsonl(root, cancelled=cancelled)
     sessions = []
-    for index, path in enumerate(paths, 1):
-        if progress and not progress(index - 1, len(paths)):
+    skipped = []
+    file_errors = []
+    for index, path in enumerate(paths):
+        if (cancelled and cancelled()) or (progress and not progress(index, len(paths))):
             break
         try:
-            sessions.append(parse_session(path))
+            session = parse_session(path, cancelled=cancelled)
+        except _ScanCancelled:
+            break
         except OSError as exc:
-            sessions.append(
-                Session(
-                    path=path,
-                    session_id=path.stem,
-                    cwd="",
-                    source="",
-                    records=[],
-                    parse_errors=[f"文件读取失败：{exc}"],
-                )
-            )
-    return ScanResult(sessions=sessions, skipped_files=skipped)
+            skipped.append(f"{path} · 无法读取")
+            file_errors.append(f"{path} · {exc.strerror or exc}")
+            continue
+        if session.recognized:
+            sessions.append(session)
+        else:
+            skipped.append(f"{path} · 缺少可识别的 Codex 事件")
+            file_errors.extend(f"{path} · {error}" for error in session.parse_errors)
+    else:
+        if progress:
+            progress(len(paths), len(paths))
+    return ScanResult(sessions, len(skipped), skipped, file_errors)
 
 
 def aggregate_cost(

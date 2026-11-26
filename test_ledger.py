@@ -7,7 +7,8 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -15,6 +16,8 @@ from codex_ledger import (
     ConfigError,
     ModelPrice,
     PriceConfig,
+    ScanResult,
+    SubagentInfo,
     Usage,
     UsageRecord,
     aggregate_cost,
@@ -131,11 +134,37 @@ class JsonlTestCase(unittest.TestCase):
         self.assertEqual(len(session.records), 2)
         self.assertEqual(session.usage, Usage(1500, 500, 150))
 
+    def test_modern_request_matches_only_one_legacy_event(self):
+        tokens = usage(100, 20, 10)
+        path = self.write([
+            self.context(), record("r1", tokens), count(tokens, tokens),
+            count(usage(200, 40, 20), tokens, timestamp="2026-11-18T16:12:01Z"),
+        ])
+        self.assertEqual([r.line_number for r in parse_session(path).records], [2, 4])
+
+    def test_matched_request_can_emit_the_same_snapshot_again(self):
+        tokens = usage(100, 20, 10)
+        path = self.write([
+            self.context(), record("r1", tokens), count(tokens, tokens),
+            event("inter_agent_communication_metadata", {"trigger_turn": False}), count(tokens, tokens),
+            record("r2", tokens), count(usage(200, 40, 20), tokens),
+        ])
+        self.assertEqual([r.response_id for r in parse_session(path).records], ["r1", "r2"])
+
     def test_duplicate_response_id_is_ignored(self):
         path = self.write([
             self.context(), record("same", usage(100, 20, 5)), record("same", usage(100, 20, 5)),
         ])
         self.assertEqual(parse_session(path).usage, Usage(100, 20, 5))
+
+    def test_replayed_response_id_does_not_leave_a_billable_legacy_echo(self):
+        tokens = usage(100, 20, 5)
+        path = self.write([
+            self.context(), record("same", tokens), count(tokens, tokens),
+            record("same", tokens, timestamp="2026-11-18T16:12:20Z"),
+            count(tokens, tokens, timestamp="2026-11-18T16:12:20Z"),
+        ])
+        self.assertEqual([r.line_number for r in parse_session(path).records], [2])
 
     def test_total_only_snapshots_are_differenced(self):
         path = self.write([
@@ -154,6 +183,21 @@ class JsonlTestCase(unittest.TestCase):
             count(usage(600, 500, 30), None, timestamp="2026-11-18T16:14:00Z"),
         ])
         self.assertEqual(parse_session(path).usage, Usage(1600, 900, 80))
+
+    def test_legacy_snapshot_uses_thread_baseline_across_model_changes_and_compaction(self):
+        first = usage(1000, 400, 50, 20)
+        path = self.write([
+            self.context("model-a", "a"),
+            count(first, first, turn="a"),
+            self.context("model-b", "b"),
+            event("event_msg", {"type": "context_compacted", "turn_id": "b"}),
+            count(usage(1700, 800, 105, 40), None, turn="b", timestamp="2026-11-18T16:13:00Z"),
+        ])
+        session = parse_session(path)
+        self.assertEqual([(r.model, r.usage) for r in session.records], [
+            ("model-a", Usage(1000, 400, 50, 20)), ("model-b", Usage(700, 400, 55, 20)),
+        ])
+        self.assertTrue(session.records[1].after_compaction)
 
     def test_cache_rebuild_does_not_drop_legacy_usage(self):
         path = self.write([
@@ -246,6 +290,47 @@ class JsonlTestCase(unittest.TestCase):
         self.assertEqual(turns[0].outcome, "completed")
         self.assertEqual(turns[0].usage, Usage(300, 170, 30))
 
+    def test_message_echoes_merge_and_repeated_user_sends_survive(self):
+        def completed_item(turn, kind, message_id, text, **fields):
+            return event("event_msg", {"type": "item_completed", "turn_id": turn, "item": {
+                "type": kind, "id": message_id, "content": [{"type": "text", "text": text}], **fields,
+            }})
+
+        prompt = "处理这些行\n    保留缩进"
+        path = self.write([
+            event("event_msg", {"type": "user_message", "message": prompt}),
+            self.task_started("t1"),
+            self.user_message("t1", prompt),
+            completed_item("t1", "UserMessage", "message-1", prompt),
+            record("r1", usage(100, 20, 10), turn="t1"),
+            self.user_message("t1", prompt, "2026-11-18T16:12:02Z"),
+            completed_item("t1", "UserMessage", "message-2", prompt),
+            completed_item("t1", "AgentMessage", "agent-1", "已完成\n下一行", phase="final_answer"),
+            self.task_complete("t1"),
+        ])
+        turn, = parse_session(path).turns
+        self.assertEqual(turn.user_prompt, prompt)
+        self.assertEqual(turn.follow_ups, [prompt])
+        self.assertEqual(turn.last_agent_message, "已完成\n下一行")
+        self.assertEqual(turn.outcome, "completed")
+
+    def test_item_only_image_prompt_counts_even_without_usage(self):
+        path = self.write([
+            self.metadata(),
+            self.task_started("t1"),
+            event("event_msg", {"type": "item_completed", "turn_id": "t1", "item": {
+                "type": "UserMessage", "id": "image-message",
+                "content": [{"type": "image", "url": "attachment"}],
+            }}),
+            event("event_msg", {"type": "turn_aborted", "turn_id": "t1", "duration_ms": 2450}),
+        ])
+        session = parse_session(path)
+        self.assertEqual(session.turn_count, 1)
+        self.assertEqual(session.title, "［图片］")
+        self.assertEqual(session.records, [])
+        self.assertEqual(session.turns[0].duration_seconds, 2.45)
+        self.assertEqual(session.turns[0].outcome, "aborted")
+
     def test_injected_user_blocks_do_not_count_as_prompt(self):
         path = self.write([
             self.user_message("t1", "# AGENTS.md instructions for D:/code\n<INSTRUCTIONS>x</INSTRUCTIONS>"),
@@ -322,6 +407,77 @@ class JsonlTestCase(unittest.TestCase):
     def test_codex_home_selects_sessions(self):
         self.write([self.context(), record("r1", usage(10, 2, 1))], ".codex/sessions/2026/a.jsonl")
         self.assertEqual(len(scan_sessions(self.root / ".codex").sessions), 1)
+
+    def test_scan_identifies_contents_and_continues_after_bad_utf8(self):
+        codex_file = self.root / "SESSION.JSONL"
+        valid = [self.metadata(), self.context(), record("r1", usage(10, 2, 1))]
+        codex_file.write_bytes(
+            (valid[0] + "\n").encode("utf-8-sig") + b"\xff\n" + "\n".join(valid[1:]).encode("utf-8")
+        )
+        other = self.write(['{"role":"user","content":"example data"}'], "dataset.jsonl")
+        empty = self.write([self.metadata()], "startup.jsonl")
+        report = scan_sessions(self.root)
+        self.assertEqual(report.file_count, 3)
+        self.assertEqual(report.skipped_files, 1)
+        self.assertIn(other.name, report.skipped[0])
+        self.assertEqual({s.path.name: len(s.records) for s in report.sessions}, {
+            codex_file.name: 1, empty.name: 0,
+        })
+        self.assertIn(f"{codex_file} · 第 2 行", report.parse_errors[0])
+
+    def test_subagent_metadata_and_delegated_turns_in_a_standalone_log(self):
+        first = "2026-11-18T16:12:00Z"
+        second = "2026-11-18T16:20:00Z"
+        path = self.write([
+            event("session_meta", {"id": "child", "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": "parent", "agent_nickname": "助手", "agent_path": "/root/lookup",
+                "agent_role": "explorer", "depth": 2,
+            }}}}),
+            self.context("gpt-test", "first"),
+            event("event_msg", {"type": "task_started", "turn_id": "first", "root_turn_id": "outer",
+                                "turn_attribution": {"parent_turn_id": "parent-turn"}}, first),
+            event("inter_agent_communication_metadata", {"trigger_turn": True}, first),
+            event("response_item", {"type": "agent_message", "author": "/root", "recipient": "/root/lookup",
+                "id": "delegate", "content": [{"type": "text", "text":
+                    "Message Type: NEW_TASK\nTask name: lookup\nSender: /root\nPayload: 核对文件\n    保留换行"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "first"},
+            }, first),
+            event("response_item", {"type": "agent_message", "author": "/root/lookup", "recipient": "/root",
+                "content": [{"type": "text", "text": "发给父会话"}],
+            }, first),
+            record("r1", usage(100, 20, 5), turn="first"),
+            self.task_complete("first", "已核对"),
+            self.task_started("second", second),
+            record("r2", usage(200, 40, 10), turn="second", timestamp=second),
+            self.task_complete("second", "追加结果", second),
+        ], "agent.JSONL")
+        session, = scan_sessions(path).sessions
+        self.assertEqual(session.subagent, SubagentInfo("parent", "助手", "/root/lookup", "explorer", 2))
+        self.assertEqual(session.title, "子智能体 · 助手")
+        first_turn, second_turn = session.turns
+        self.assertEqual(first_turn.parent_turn_id, "parent-turn")
+        self.assertEqual(first_turn.user_prompt, "")
+        message, = first_turn.agent_messages
+        self.assertTrue(message.starts_turn)
+        self.assertEqual(message.text, "核对文件\n    保留换行")
+        self.assertEqual(first_turn.summary_text(), "核对文件 保留换行")
+        self.assertEqual(first_turn.last_agent_message, "已核对")
+        self.assertEqual(second_turn.usage, Usage(200, 40, 10))
+        self.assertEqual(first_turn.usage + second_turn.usage, session.usage)
+
+    def test_flat_subagent_metadata_keeps_legacy_usage_and_user_fork_stays_main(self):
+        child = self.write([
+            event("session_meta", {"id": "child", "thread_source": "subagent", "parent_thread_id": "parent"}),
+            count(usage(100, 20, 5), usage(100, 20, 5), turn=""),
+        ], "child.jsonl")
+        fork = self.write([
+            event("session_meta", {"id": "fork", "thread_source": "user", "forked_from_id": "parent"}),
+        ], "fork.jsonl")
+        agent_session = parse_session(child)
+        self.assertEqual(agent_session.subagent.parent_thread_id, "parent")
+        turn, = agent_session.turns
+        self.assertEqual(turn.usage, agent_session.usage)
+        self.assertFalse(parse_session(fork).is_subagent)
 
 
 class PriceConfigTest(unittest.TestCase):
@@ -745,7 +901,7 @@ class QtTest(unittest.TestCase):
 
     def test_filter_summary_and_all_pages(self):
         window = self.make_window()
-        window.scan_finished(type("Result", (), {"sessions": [self.sample_session()], "parse_errors": []})())
+        window.scan_finished(ScanResult([self.sample_session()]))
         window.show()
         self.app.processEvents()
         self.assertEqual(window.session_table.rowCount(), 1)
@@ -769,7 +925,7 @@ class QtTest(unittest.TestCase):
 
     def test_small_window_keeps_layout_readable(self):
         window = self.make_window()
-        window.scan_finished(type("Result", (), {"sessions": [self.sample_session()], "parse_errors": []})())
+        window.scan_finished(ScanResult([self.sample_session()]))
         window.show()
         window.resize(1380, 620)
         self.app.processEvents()
@@ -782,7 +938,7 @@ class QtTest(unittest.TestCase):
 
     def test_switching_to_table_pages_resets_outer_scroll(self):
         window = self.make_window()
-        window.scan_finished(type("Result", (), {"sessions": [self.sample_session()], "parse_errors": []})())
+        window.scan_finished(ScanResult([self.sample_session()]))
         window.show()
         levels = []
         for page in range(4):
@@ -796,7 +952,7 @@ class QtTest(unittest.TestCase):
     def test_custom_date_range_does_not_crash(self):
         from PyQt6.QtCore import QDate
         window = self.make_window()
-        window.scan_finished(type("Result", (), {"sessions": [self.sample_session()], "parse_errors": []})())
+        window.scan_finished(ScanResult([self.sample_session()]))
         window.show()
         self.app.processEvents()
         # QDate 没有 toPython()，用错方法会直接让整个界面崩溃。
@@ -846,9 +1002,117 @@ class QtTest(unittest.TestCase):
         self.assertEqual(len(filtered_sessions([session], model="gpt-test")), 1)
         self.assertEqual(filtered_sessions([session], model="other"), [])
 
+    def test_filter_changes_task_rows_and_amounts_in_session_detail(self):
+        from PyQt6.QtWidgets import QTabWidget
+        from main import SessionDialog
+
+        window = self.make_window()
+        self.addCleanup(window.close)
+        session = self.sample_session()
+        first, = session.records
+        tomorrow = first.timestamp + timedelta(days=1)
+        later = replace(first, timestamp=tomorrow, model="other", line_number=3)
+        next_task = replace(later, turn_id="turn-b", response_id="r3", line_number=4)
+        first_turn = session.turns[0]
+        session.records += [later, next_task]
+        session.turns = [
+            replace(first_turn, records=[first, later], follow_ups=["保留这条补充"]),
+            replace(first_turn, turn_id="turn-b", records=[next_task], started_at=tomorrow),
+        ]
+
+        day = first.timestamp.astimezone().date()
+        filtered, = filtered_sessions([session], day, day, "gpt-test", "这条补充")
+        self.assertEqual(filtered.records, [first])
+        self.assertEqual(filtered.turn_count, 1)
+        self.assertEqual(filtered.turns[0].usage, filtered.usage)
+        self.assertEqual(len(session.turns[0].records), 2)
+        dialog = SessionDialog(filtered, window.config, window)
+        self.addCleanup(dialog.close)
+        table = dialog.findChild(QTabWidget).widget(0)
+        self.assertEqual(table.rowCount(), 1)
+        self.assertEqual(table.item(0, 9).text(), "707")
+        self.assertEqual(table.item(0, 11).text(), "$0.0246")
+
+    def test_turn_detail_displays_full_plain_text(self):
+        from PyQt6.QtWidgets import QPlainTextEdit, QTabWidget
+        from main import TurnDialog
+
+        window = self.make_window()
+        self.addCleanup(window.close)
+        turn, = self.sample_session().turns
+        prompt = "<tag>\n    " + 640 * "字" + "结尾"
+        turn = replace(turn, user_prompt=prompt, follow_ups=["补充内容"], last_agent_message="最终内容")
+        dialog = TurnDialog(turn, window.config, window)
+        self.addCleanup(dialog.close)
+        tabs = dialog.findChild(QTabWidget)
+        self.assertEqual(tabs.tabText(1), "任务内容")
+        content = tabs.widget(1)
+        self.assertIsInstance(content, QPlainTextEdit)
+        self.assertTrue(content.isReadOnly())
+        self.assertIn(prompt, content.toPlainText())
+        self.assertIn("最终内容", content.toPlainText())
+
+    def test_scan_status_and_empty_state_distinguish_unsupported_files(self):
+        window = self.make_window()
+        self.addCleanup(window.close)
+        window.scan_finished(ScanResult([], 1, ["dataset.jsonl · 缺少可识别的 Codex 事件"]))
+        self.assertIn("跳过 1 个文件", window.status.text())
+        self.assertIn("识别到 0 个 Codex 会话", window.empty_state.text())
+        self.assertFalse(window.scan_details_button.isHidden())
+        window.scan_finished(ScanResult([self.sample_session()]))
+        self.assertTrue(window.empty_state.isHidden())
+        self.assertTrue(window.scan_details_button.isHidden())
+
+    def test_subagents_can_be_filtered_and_details_show_parent(self):
+        from PyQt6.QtWidgets import QLabel, QTabWidget
+        from main import SessionDialog
+
+        window = self.make_window()
+        self.addCleanup(window.close)
+        parent = self.sample_session()
+        child = replace(parent, session_id="child", path=Path("child.jsonl"), subagent=SubagentInfo(
+            parent_thread_id=parent.session_id, nickname="助手", path="/root/lookup", depth=1,
+        ))
+        window.scan_finished(ScanResult([parent, child]))
+        self.assertIn("其中 1 个子智能体", window.status.text())
+        window.session_kind_filter.setCurrentText("子智能体")
+        window.search.setText(parent.session_id)
+        window.search_timer.stop()
+        window.apply_filters()
+        self.assertEqual(window.filtered, [child])
+        self.assertIn("子智能体 · 助手", window.session_table.item(0, 1).text())
+        dialog = SessionDialog(child, window.config, window, parent_title=parent.title)
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.findChild(QTabWidget).tabText(0), "执行轮次（1）")
+        self.assertTrue(any(
+            f"父会话 ID：{parent.session_id}" in label.text() and parent.title in label.text()
+            for label in dialog.findChildren(QLabel)
+        ))
+        window.session_kind_filter.setCurrentText("主会话")
+        self.assertEqual(window.filtered, [parent])
+
+    def test_window_closes_when_scan_is_cancelled_before_worker_runs(self):
+        from PyQt6.QtTest import QTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "session.jsonl")
+            path.write_text(event("session_meta", {"id": "session-a"}), encoding="utf-8")
+            window = self.make_window()
+            window.show()
+            window.source_edit.setText(str(path))
+            LedgerWindow.start_scan(window)
+            self.assertTrue(window.scan_threads)
+            window.close()
+            for _ in range(300):
+                if not window.scan_threads:
+                    break
+                QTest.qWait(10)
+            self.assertFalse(window.scan_threads)
+            self.assertFalse(window.isVisible())
+
     def test_export_current_filter_to_csv(self):
         window = self.make_window()
-        window.scan_finished(type("Result", (), {"sessions": [self.sample_session()], "parse_errors": []})())
+        window.scan_finished(ScanResult([self.sample_session()]))
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "usage.csv"
             original = QFileDialog.getSaveFileName
@@ -868,6 +1132,8 @@ class QtTest(unittest.TestCase):
             self.assertEqual(rows[0]["输出tokens"], "707")
             self.assertEqual(rows[0]["缓存输入tokens"], "14720")
             self.assertEqual(rows[0]["缓存命中率"], "64.7%")
+            self.assertEqual(rows[0]["会话类型"], "主会话")
+            self.assertEqual(rows[0]["父会话ID"], "")
         window.close()
 
     def test_price_dialog_saves_and_preserves_notes(self):
